@@ -1,0 +1,31 @@
+fastapi
+uvicorn[standard]
+pymongo
+python-dotenv
+pyjwt
+httpx
+requests
+pydantic
+
+langgraph
+langchain
+langchain-core
+langchain-groq
+anthropic
+
+numpy
+pandas
+scikit-learn
+yfinance
+keras
+tensorflow
+
+rank-bm25
+sentence-transformers
+langchain-community
+faiss-cpu
+
+apscheduler
+
+# optional, only needed if you set CHECKPOINTER_BACKEND=sqlite
+# langgraph-checkpoint-sqlite

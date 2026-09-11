@@ -1,0 +1,37 @@
+{
+  "portfolio": [
+    {
+      "symbol": "INFY",
+      "quantity": 50,
+      "buy_price": 1650.0,
+      "buy_date": "2024-08-01",
+      "current_price": 1490.0,
+      "asset_type": "equity"
+    },
+    {
+      "symbol": "TCS",
+      "quantity": 20,
+      "buy_price": 3400.0,
+      "buy_date": "2025-09-15",
+      "current_price": 3950.0,
+      "asset_type": "equity"
+    },
+    {
+      "symbol": "NIFTYBEES",
+      "quantity": 100,
+      "buy_price": 210.0,
+      "buy_date": "2023-05-10",
+      "current_price": 265.0,
+      "asset_type": "etf"
+    }
+  ],
+  "tax_profile": {
+    "filing_status": "single",
+    "annual_income": 1800000,
+    "country": "IN",
+    "realized_gains_ytd": 120000,
+    "realized_losses_ytd": 0,
+    "section_80c_used": 60000,
+    "retirement_contrib_ytd": 0
+  }
+}
