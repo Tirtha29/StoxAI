@@ -18,6 +18,7 @@ CLI usage (unchanged behavior, now under one file):
 """
 
 import glob
+import hashlib
 import logging
 import os
 import re
@@ -204,7 +205,8 @@ class MongoVectorStore:
 
         ops = []
         for chunk, emb in zip(chunks, embeddings):
-            doc_id = f"{chunk['source']}::{chunk.get('header_path', '')}::{hash(chunk['text'])}"
+            content_id = hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest()
+            doc_id = f"{chunk['source']}::{chunk.get('header_path', '')}::{content_id}"
             ops.append(UpdateOne(
                 {"_id": doc_id},
                 {"$set": {
