@@ -6,6 +6,7 @@ pyjwt
 httpx
 requests
 pydantic
+bcrypt
 
 langgraph
 langchain
@@ -24,8 +25,6 @@ rank-bm25
 sentence-transformers
 langchain-community
 faiss-cpu
-
-apscheduler
 
 # optional, only needed if you set CHECKPOINTER_BACKEND=sqlite
 # langgraph-checkpoint-sqlite

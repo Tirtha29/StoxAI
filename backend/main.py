@@ -1,9 +1,21 @@
 """
-Single FastAPI app for the whole merged product: Google OAuth + JWT auth
-(from Hackathon/backend/main.py) and the multi-agent /chat endpoint (from
-tax_saving_agent/api.py), mounted together.
+Single FastAPI app for the whole merged product: manual email/username/
+password auth + JWT, and the multi-agent /chat endpoint, mounted together.
 
-WHY ONE SERVICE INSTEAD OF TWO (task 4's "or tell me clearly"):
+AUTH CHANGE (from Google OAuth to manual signup/login):
+  Google OAuth was throwing errors during testing, so this now uses plain
+  email + username + password instead. auth_utils.py (JWT creation and
+  verification) is COMPLETELY UNCHANGED — it only ever worked off a
+  user_id + email, never cared how the user got authenticated, so nothing
+  there needed to change. /me, /chat, and /admin/ingest-news are also
+  unchanged below — they only consume the JWT, same as before.
+
+  Passwords are hashed with bcrypt before storage — never store or log a
+  raw password. Existing users created via the old Google flow (if any
+  are in your Mongo already) have no password_hash and can't log in
+  through this new flow; they'd need to sign up fresh.
+
+WHY ONE SERVICE INSTEAD OF TWO:
   - You're deploying to Render as a hackathon/small-team project, and the
     Streamlit frontend just needs one base URL + one CORS origin to talk
     to. Two services means two Render web services, two sets of secrets,
@@ -14,10 +26,6 @@ WHY ONE SERVICE INSTEAD OF TWO (task 4's "or tell me clearly"):
     tensorflow, yfinance, sentence-transformers) into the SAME process as
     auth, so a cold start on Render's free/small tiers will be slower for
     login too, and a crash in model loading takes auth down with it.
-  - Split them again later (same api.py you already have, unchanged) if
-    /chat's traffic or resource needs grow enough to want independent
-    scaling - nothing here prevents that, call_remote_agent() in graph.py
-    already exists for exactly that kind of split.
 
 Run:
     uvicorn main:app --reload --port 8000
@@ -27,12 +35,10 @@ from typing import List, Optional
 
 import logging
 
-import httpx
-from urllib.parse import urlencode
+import bcrypt
 from bson import ObjectId
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 import config
@@ -74,17 +80,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
-
 # compiled once at startup with a checkpointer attached - see graph.py's
 # _make_checkpointer() for the in-memory-vs-sqlite/postgres tradeoff
 _graph_app = build_graph()
 
 
 # ===========================================================================
-# Auth routes (unchanged behavior from Hackathon/backend/main.py)
+# Password hashing helpers
+# ===========================================================================
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        # malformed/missing hash on the user doc (e.g. a leftover Google-only
+        # account with no password_hash at all) - treat as "wrong password"
+        return False
+
+
+# ===========================================================================
+# Auth routes — manual email + username + password
 # ===========================================================================
 
 @app.get("/")
@@ -97,79 +116,65 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/auth/google/login")
-def google_login():
-    params = {
-        "client_id": config.GOOGLE_CLIENT_ID,
-        "redirect_uri": config.GOOGLE_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "openid email profile",
-        "access_type": "offline",
-        "prompt": "consent",
-    }
-    url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
-    return RedirectResponse(url)
+class SignupRequest(BaseModel):
+    email: str
+    username: str
+    password: str
 
 
-@app.get("/auth/google/callback")
-def google_callback(code: str = None, error: str = None):
-    if error:
-        return RedirectResponse(f"{config.FRONTEND_URL}?error={error}")
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing code")
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
-    token_data = {
-        "code": code,
-        "client_id": config.GOOGLE_CLIENT_ID,
-        "client_secret": config.GOOGLE_CLIENT_SECRET,
-        "redirect_uri": config.GOOGLE_REDIRECT_URI,
-        "grant_type": "authorization_code",
-    }
-    token_res = httpx.post(GOOGLE_TOKEN_URL, data=token_data)
-    if token_res.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to get token from Google")
-    token_json = token_res.json()
-    google_access_token = token_json.get("access_token")
-    google_refresh_token = token_json.get("refresh_token")
 
-    userinfo_res = httpx.get(
-        GOOGLE_USERINFO_URL,
-        headers={"Authorization": f"Bearer {google_access_token}"},
-    )
-    if userinfo_res.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to get user info from Google")
-    userinfo = userinfo_res.json()
+class AuthResponse(BaseModel):
+    token: str
+    user_id: str
+    username: str
+    email: str
 
-    email = userinfo.get("email")
-    if not email or not email.endswith("@gmail.com"):
-        return RedirectResponse(f"{config.FRONTEND_URL}?error=gmail_only")
 
-    google_id = userinfo.get("id")
-    username = userinfo.get("name")
-    photo = userinfo.get("picture")
+@app.post("/auth/signup", response_model=AuthResponse)
+def signup(req: SignupRequest):
+    email = req.email.strip().lower()
+    username = req.username.strip()
 
-    existing_user = users_collection.find_one({"google_id": google_id})
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    if not username:
+        raise HTTPException(status_code=400, detail="Username can't be empty")
+    if len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-    update_fields = {
-        "username": username,
+    if users_collection.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="An account with this email already exists")
+
+    user_doc = {
         "email": email,
-        "photo": photo,
-        "google_access_token": google_access_token,
+        "username": username,
+        "password_hash": hash_password(req.password),
+        "photo": None,
     }
-    if google_refresh_token:
-        update_fields["google_refresh_token"] = google_refresh_token
+    result = users_collection.insert_one(user_doc)
+    user_id = str(result.inserted_id)
 
-    if existing_user:
-        users_collection.update_one({"google_id": google_id}, {"$set": update_fields})
-        user_id = str(existing_user["_id"])
-    else:
-        update_fields["google_id"] = google_id
-        result = users_collection.insert_one(update_fields)
-        user_id = str(result.inserted_id)
+    token = create_jwt_token(user_id=user_id, email=email)
+    return AuthResponse(token=token, user_id=user_id, username=username, email=email)
 
-    jwt_token = create_jwt_token(user_id=user_id, email=email)
 
-    return RedirectResponse(f"{config.FRONTEND_URL}?token={jwt_token}")
+@app.post("/auth/login", response_model=AuthResponse)
+def login(req: LoginRequest):
+    email = req.email.strip().lower()
+    user = users_collection.find_one({"email": email})
+
+    if not user or not user.get("password_hash") or not verify_password(req.password, user["password_hash"]):
+        # deliberately the same error for "no such user" and "wrong password" -
+        # don't leak which one it was
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    user_id = str(user["_id"])
+    token = create_jwt_token(user_id=user_id, email=email)
+    return AuthResponse(token=token, user_id=user_id, username=user.get("username", ""), email=email)
 
 
 @app.get("/me")

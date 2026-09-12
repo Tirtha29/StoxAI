@@ -1,271 +1,601 @@
 """
-StoxAI — Streamlit frontend
+StoxAI — Streamlit frontend, fully wired to the real backend
+================================================================
 
-Flow: Home -> (Login/Sign up button -> modal) -> Dashboard (Chat / Portfolio / Agent activity)
+Nothing in this file is mocked or hardcoded. Every screen renders
+whatever the backend actually returns:
 
-Wired for real against main.py's actual contract:
-  - Google OAuth redirect + JWT capture via ?token= query param
-  - /me to fetch the logged-in user
-  - /chat for every agent query
+  POST /auth/signup         -> real account creation (email/username/password)
+  POST /auth/login          -> real credential check, returns a JWT
+  GET  /me                  -> real user profile
+  POST /chat                -> real LangGraph response
 
-Run:
-    pip install -r requirements.txt
-    streamlit run app.py
+AUTH NOTE: switched from Google OAuth to manual email/username/password
+because OAuth was erroring during testing — see main.py for the matching
+backend change. There's no query-param token handoff anymore; /auth/login
+and /auth/signup return the JWT directly in the JSON response.
 
-Config:
-    Create .streamlit/secrets.toml with:
-        API_BASE_URL = "http://localhost:8000"
+The "Agent run details" panel does NOT guess which agent ran — the
+backend's ChatResponse includes `intent` directly (see main.py's
+ChatResponse model / core.py's AgentState), so the panel just reads that
+field and renders whichever result key came back non-empty:
+tax_result, stock_prediction_result, stock_info_result,
+save_interest_result, planning_result, report_result.
+
+Known shapes (tax_result, stock_prediction_result) are rendered with a
+proper layout because their Pydantic models are defined in core.py
+(TaxSavingResponse, StockPredictionResult). Shapes not pinned down in
+core.py (planning_result, report_result, stock_info_result) fall back to
+a generic dynamic renderer — whatever keys/values the backend actually
+sends, displayed as-is, so the UI never lies about data it hasn't seen.
+
+BEFORE RUNNING:
+  1. Set BACKEND_URL below or via .streamlit/secrets.toml.
+  2. Backend's FRONTEND_URL must point back at wherever this runs.
+
+KNOWN LIMITATION — the watchlist shown in the sidebar is NOT fetched from
+a database on load, because no such endpoint exists yet: main.py has no
+GET /watchlist route, and GET /me deliberately doesn't include `stocks`
+(checked directly in main.py's get_me()). So the sidebar's watchlist is
+only ever populated from real save_interest_result payloads returned
+during THIS session's /chat calls — it resets on page reload even though
+the data is still sitting in Mongo. If persistence across reloads
+matters before the demo, the real fix is a small addition to main.py:
+
+    @app.get("/watchlist")
+    def get_watchlist(current_user: dict = Depends(get_current_user)):
+        return agents.get_user_stocks(current_user["user_id"])
+
+That's a one-function addition using a function that already exists in
+agents.py — ask whoever owns main.py before adding it, same as the
+news_agent.py situation earlier.
 """
-from datetime import datetime
 
+import datetime as dt
+
+import requests
 import streamlit as st
 
-from api_client import google_login_url, fetch_me, send_chat, INTENT_TO_AGENT
+st.set_page_config(page_title="StoxAI", page_icon="S", layout="wide")
 
-st.set_page_config(page_title="StoxAI", page_icon="📈", layout="wide")
+# ---------------------------------------------------------------------------
+# BACKEND URL
+# ---------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# Theme (matches your Nivesh AI mockups: dark navy + orange accent)
-# --------------------------------------------------------------------------
-st.markdown("""
-<style>
-.stApp { background-color: #0b1120; color: #e2e8f0; }
-.hero-title { font-size: 3rem; font-weight: 800; line-height: 1.15; color: #f8fafc; }
-.hero-sub { color: #94a3b8; font-size: 1.05rem; max-width: 640px; }
-.badge-pill {
-    display: inline-block; background: rgba(148,163,184,0.12); color: #cbd5e1;
-    padding: 4px 14px; border-radius: 999px; font-size: 0.85rem; margin-bottom: 1rem;
+try:
+    BACKEND_URL = st.secrets["BACKEND_URL"]
+except Exception:
+    BACKEND_URL = "http://localhost:8000"  # local dev fallback
+
+REQUEST_TIMEOUT = 45  # Render free tier can cold-start slowly
+
+
+# ---------------------------------------------------------------------------
+# THEME
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #0B1220;
+        background-image: radial-gradient(circle, #16213A 1px, transparent 1px);
+        background-size: 24px 24px;
+        color: #E4E8F1;
+    }
+    #MainMenu, footer, header {visibility: hidden;}
+    .sx-logo { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .sx-logo-mark {
+        width: 26px; height: 26px; border-radius: 7px; background: #E8A33D;
+        display: flex; align-items: center; justify-content: center;
+        font-weight: 600; font-size: 13px; color: #1A1204;
+    }
+    .sx-logo-text { font-weight: 600; font-size: 16px; color: #F3F5FA; }
+    .sx-badge {
+        display: inline-block; font-size: 0.72rem; font-weight: 500;
+        padding: 3px 10px; border-radius: 20px;
+    }
+    .badge-tax_optimization { background: rgba(52,211,153,0.15); color: #34D399; border: 1px solid rgba(52,211,153,0.35);}
+    .badge-stock_prediction { background: rgba(96,165,250,0.15); color: #60A5FA; border: 1px solid rgba(96,165,250,0.35);}
+    .badge-stock_info { background: rgba(96,165,250,0.15); color: #60A5FA; border: 1px solid rgba(96,165,250,0.35);}
+    .badge-save_interest { background: rgba(232,163,61,0.15); color: #E8A33D; border: 1px solid rgba(232,163,61,0.35);}
+    .badge-portfolio_planning { background: rgba(167,139,250,0.15); color: #A78BFA; border: 1px solid rgba(167,139,250,0.35);}
+    .badge-report { background: rgba(167,139,250,0.15); color: #A78BFA; border: 1px solid rgba(167,139,250,0.35);}
+    .badge-general { background: rgba(107,118,144,0.15); color: #9AA4BD; border: 1px solid rgba(107,118,144,0.35);}
+    .sx-panel {
+        border: 1px solid #223052; border-radius: 10px; padding: 0.9rem 1rem;
+        background: #111A2C; margin-bottom: 0.6rem;
+    }
+    .sx-meta { font-size: 0.72rem; color: #6B7690; margin-top: 4px; }
+    div.stButton > button, div.stLinkButton > a {
+        background-color: #E8A33D !important; color: #1A1204 !important; border: none !important;
+        border-radius: 8px; font-weight: 600;
+    }
+    section[data-testid="stSidebar"] { background-color: #0D1524; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+INTENT_LABELS = {
+    "tax_optimization": "Tax agent",
+    "stock_prediction": "Prediction agent",
+    "stock_info": "Stock info agent",
+    "save_interest": "Watchlist agent",
+    "portfolio_planning": "Planning agent",
+    "report": "Report agent",
+    "general": "General knowledge",
 }
-.feature-card {
-    background: #131c31; border-left: 4px solid #f5a623; border-radius: 10px;
-    padding: 1.1rem 1.3rem; height: 100%;
-}
-.feature-card h4 { margin: 0 0 .4rem 0; color: #f8fafc; }
-.feature-card p { color: #94a3b8; font-size: 0.9rem; margin: 0; }
-.run-card {
-    background: #131c31; border-radius: 10px; padding: 0.8rem 1rem; margin-bottom: 0.6rem;
-}
-div.stButton > button[kind="primary"] {
-    background-color: #f5a623; color: #111827; border: none; font-weight: 700;
-}
-</style>
-""", unsafe_allow_html=True)
 
-FEATURES = [
-    ("#f5a623", "News agent", "Fuses today's headlines with the model's odds into one explained call."),
-    ("#a78bfa", "Planning agent", "Scores diversification and volatility, then suggests rebalancing."),
-    ("#60a5fa", "Market prediction", "Estimates tomorrow's direction, retrained every night."),
-    ("#f87171", "Short-selling agent", "Flags bearish calls and checks margin, entry, and stop levels."),
-    ("#2dd4bf", "Tax agent", "Answers capital-gains questions grounded in current tax rules."),
-    ("#f5a623", "Email digest", "A daily summary of verdicts, delivered before markets open."),
-]
 
-# --------------------------------------------------------------------------
-# Session state
-# --------------------------------------------------------------------------
-st.session_state.setdefault("token", None)
-st.session_state.setdefault("user", None)
-st.session_state.setdefault("chat_history", [])   # [{role, content}]
-st.session_state.setdefault("agent_runs", [])      # [{agent, color, headline, detail, ts}]
-st.session_state.setdefault("portfolio", [])       # [PortfolioHolding dicts]
+# ---------------------------------------------------------------------------
+# SESSION STATE
+# ---------------------------------------------------------------------------
 
-# Capture ?token=... coming back from /auth/google/callback
-qp = st.query_params
-if "token" in qp and not st.session_state.token:
-    candidate = qp["token"]
-    user = fetch_me(candidate)
-    if user:
-        st.session_state.token = candidate
-        st.session_state.user = user
-        st.query_params.clear()
-        st.rerun()
+def init_state():
+    defaults = {
+        "page": "home",      # "home" | "login" | (dashboard shows automatically once user is set)
+        "token": None,
+        "user": None,
+        "chat_history": [],
+        "run_log": [],       # every real /chat response, in full, newest first
+        "tax_profile": None,
+        "watchlist": {},     # {SYMBOL: {live_price, predicted_price, updated_at}} — derived
+                              # ONLY from real save_interest_result.watchlist payloads seen
+                              # this session. No GET /watchlist endpoint exists yet (see
+                              # note in render_dashboard), so this resets on page reload.
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+
+# ---------------------------------------------------------------------------
+# BACKEND CALLS
+# ---------------------------------------------------------------------------
+
+def fetch_me(token: str):
+    try:
+        res = requests.get(
+            f"{BACKEND_URL}/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        st.error(f"Couldn't reach the backend at {BACKEND_URL} — is it running/deployed? ({e})")
+        return None
+    return res.json() if res.status_code == 200 else None
+
+
+def send_chat(user_query: str) -> dict:
+    headers = {"Authorization": f"Bearer {st.session_state.token}"}
+    payload = {
+        "user_query": user_query,
+        "chat_history": st.session_state.chat_history,
+        "portfolio": [],
+        "tax_profile": st.session_state.tax_profile,
+    }
+    res = requests.post(f"{BACKEND_URL}/chat", json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    res.raise_for_status()
+    return res.json()
+
+
+if st.session_state.token and not st.session_state.user:
+    # Defensive fallback only — normal login/signup sets both token and
+    # user together via _apply_auth_response(). This path only matters if
+    # a token somehow exists without user data already attached.
+    me = fetch_me(st.session_state.token)
+    if me:
+        st.session_state.user = me
     else:
-        st.query_params.clear()
-        st.error("Login didn't go through — token was rejected by /me. Check JWT_SECRET_KEY / clock skew on the backend.")
+        st.session_state.token = None
+        st.warning("Your session expired. Please log in again.")
 
 
-# --------------------------------------------------------------------------
-# Login / sign up modal
-# --------------------------------------------------------------------------
-@st.dialog("Log in")
-def login_dialog():
-    st.caption("Welcome back to StoxAI.")
-    st.link_button("Continue with Google", google_login_url(), use_container_width=True, type="primary")
-    st.divider()
-    st.caption(
-        "The backend currently only supports Google sign-in (see auth/google/* "
-        "routes in main.py). If you want username/password too, that route "
-        "needs to be added server-side first."
+def process_chat_turn(user_message: str, echo_in_chat: bool = True):
+    """
+    Sends a real message through /chat and updates every piece of state
+    that depends on the response — chat transcript, run log, AND the
+    cached watchlist (any turn can return save_interest_result, not just
+    ones sent from the dedicated widget below, since a normal chat
+    message like "my favorite stock is TSLA" triggers the same node).
+    """
+    response = send_chat(user_message)
+    reply = response.get("final_response", "(no response)")
+
+    if echo_in_chat:
+        st.session_state.chat_history.append({"role": "user", "content": user_message})
+        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+
+    st.session_state.run_log.insert(
+        0, {"response": response, "query": user_message, "ts": dt.datetime.now().strftime("%H:%M:%S")}
     )
-    with st.expander("Dev / demo login (no backend needed)"):
-        st.caption("Useful for building the UI before your backend is deployed.")
-        demo_name = st.text_input("Demo username", value="rahul_k")
-        if st.button("Continue with demo user"):
-            st.session_state.token = "DEV-DEMO-TOKEN"
-            st.session_state.user = {"username": demo_name, "email": f"{demo_name}@demo.local", "photo": None}
-            st.rerun()
+
+    save_interest = response.get("save_interest_result") or {}
+    if isinstance(save_interest, dict) and save_interest.get("watchlist"):
+        st.session_state.watchlist = save_interest["watchlist"]  # real data straight from Mongo, via the backend
+
+    return response
 
 
-# --------------------------------------------------------------------------
-# HOME PAGE
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DYNAMIC RENDERERS — every function here only shows what the backend
+# actually sent. No field is assumed to exist beyond what core.py defines;
+# anything not pinned down there is displayed generically.
+# ---------------------------------------------------------------------------
+
+def render_generic(data):
+    """Fallback for shapes not pinned down as a Pydantic model in core.py
+    (planning_result, report_result, stock_info_result) — shows exactly
+    what came back, nothing invented."""
+    if data is None:
+        return
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, (dict, list)):
+                st.markdown(f"**{k}**")
+                st.json(v)
+            else:
+                st.markdown(f"**{k}:** {v}")
+    elif isinstance(data, list):
+        st.json(data)
+    else:
+        st.write(data)
+
+
+def render_tax_result(data: dict):
+    """Matches core.py's TaxSavingResponse: suggestions[], total_estimated_savings, explanation."""
+    total = data.get("total_estimated_savings")
+    if total is not None:
+        st.markdown(f"**Estimated savings: {total:,.2f}**")
+    for s in data.get("suggestions", []) or []:
+        with st.container():
+            st.markdown(f"**{s.get('title', s.get('type', 'Suggestion'))}**")
+            if s.get("detail"):
+                st.caption(s["detail"])
+            if s.get("estimated_savings"):
+                st.caption(f"Est. savings: {s['estimated_savings']:,.2f}")
+            if s.get("source_snippets"):
+                with st.expander("Source snippets (RAG)"):
+                    for sn in s["source_snippets"]:
+                        st.caption(f"• {sn}")
+    if data.get("explanation"):
+        st.markdown("---")
+        st.caption(data["explanation"])
+
+
+def render_stock_prediction_result(data: list):
+    """Matches core.py's StockPredictionResult: symbol, predicted_direction,
+    predicted_range, confidence, explanation."""
+    for item in data or []:
+        symbol = item.get("symbol", "?")
+        direction = item.get("predicted_direction", "?")
+        confidence = item.get("confidence")
+        st.markdown(f"**{symbol}** — {direction}" + (f" ({confidence:.0%} confidence)" if confidence is not None else ""))
+        if item.get("predicted_range"):
+            st.caption(f"Predicted range: {item['predicted_range']}")
+        if item.get("explanation"):
+            st.caption(item["explanation"])
+
+
+def render_agent_details(response: dict):
+    intent = response.get("intent") or "general"
+    label = INTENT_LABELS.get(intent, intent)
+    badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
+    st.markdown(f"<span class='sx-badge {badge_class}'>{label}</span>", unsafe_allow_html=True)
+    st.write("")
+
+    if intent == "tax_optimization" and response.get("tax_result"):
+        render_tax_result(response["tax_result"])
+    elif intent == "stock_prediction" and response.get("stock_prediction_result"):
+        render_stock_prediction_result(response["stock_prediction_result"])
+    elif intent == "stock_info" and response.get("stock_info_result"):
+        render_generic(response["stock_info_result"])
+    elif intent == "save_interest" and response.get("save_interest_result"):
+        render_generic(response["save_interest_result"])
+    elif intent == "portfolio_planning" and response.get("planning_result"):
+        render_generic(response["planning_result"])
+    elif intent == "report" and response.get("report_result"):
+        render_generic(response["report_result"])
+    else:
+        st.caption("No specialized agent data returned for this turn.")
+
+
+# ---------------------------------------------------------------------------
+# LOGIN SCREEN
+# ---------------------------------------------------------------------------
+
+def signup_request(username: str, email: str, password: str):
+    res = requests.post(
+        f"{BACKEND_URL}/auth/signup",
+        json={"username": username, "email": email, "password": password},
+        timeout=REQUEST_TIMEOUT,
+    )
+    return res
+
+
+def login_request(email: str, password: str):
+    res = requests.post(
+        f"{BACKEND_URL}/auth/login",
+        json={"email": email, "password": password},
+        timeout=REQUEST_TIMEOUT,
+    )
+    return res
+
+
+def _apply_auth_response(data: dict):
+    st.session_state.token = data["token"]
+    st.session_state.user = {
+        "user_id": data["user_id"],
+        "username": data["username"],
+        "email": data["email"],
+        "photo": None,  # manual signup has no avatar — real value, not a placeholder image
+    }
+
+
 def render_home():
     top_l, top_r = st.columns([5, 1])
     with top_l:
-        st.markdown("### 📈 **StoxAI**")
+        st.markdown(
+            '<div class="sx-logo"><div class="sx-logo-mark">S</div>'
+            '<div class="sx-logo-text">StoxAI</div></div>',
+            unsafe_allow_html=True,
+        )
     with top_r:
-        if st.button("Login / Sign up", type="primary", use_container_width=True):
-            login_dialog()
-
-    st.markdown('<div class="badge-pill">6 agents, one wishlist</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-title">One dashboard for the news,<br>the numbers, and the tax bill</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<p class="hero-sub">StoxAI reads today\'s news, checks a prediction model\'s odds, '
-        'and scores your diversification every morning — so all you have to do is ask.</p>',
-        unsafe_allow_html=True,
-    )
-    st.write("")
-    if st.button("Get started", type="primary"):
-        login_dialog()
-
-    st.write("")
-    st.write("")
-    cols = st.columns(3)
-    for i, (color, title, desc) in enumerate(FEATURES):
-        with cols[i % 3]:
-            st.markdown(
-                f"""<div class="feature-card" style="border-left-color:{color}">
-                        <h4>{title}</h4><p>{desc}</p>
-                    </div>""",
-                unsafe_allow_html=True,
-            )
-            st.write("")
-
-
-# --------------------------------------------------------------------------
-# DASHBOARD
-# --------------------------------------------------------------------------
-def log_run(intent: str, headline: str, detail: str):
-    agent_name, color = INTENT_TO_AGENT.get(intent, ("Assistant", "#94a3b8"))
-    st.session_state.agent_runs.insert(0, {
-        "agent": agent_name, "color": color, "headline": headline,
-        "detail": detail, "ts": datetime.now().strftime("%H:%M:%S"),
-    })
-    st.session_state.agent_runs = st.session_state.agent_runs[:20]
-
-
-def render_dashboard():
-    user = st.session_state.user or {}
-    header_l, header_r = st.columns([5, 1])
-    with header_l:
-        st.markdown(f"### Welcome back, **{user.get('username', 'trader')}**")
-    with header_r:
-        if st.button("Log out", use_container_width=True):
-            for k in ("token", "user", "chat_history", "agent_runs"):
-                st.session_state[k] = None if k in ("token", "user") else []
+        if st.button("Login", use_container_width=True, key="home_login_nav"):
+            st.session_state.page = "login"
             st.rerun()
 
-    tab_chat, tab_portfolio, tab_activity = st.tabs(["Chat", "Portfolio", "Agent activity"])
+    st.markdown(
+        "<h1 style='color:#F3F5FA; font-size:2.2rem; font-weight:600; max-width:640px; "
+        "line-height:1.3;'>One dashboard for the news, the numbers, and the tax bill</h1>"
+        "<p style='color:#9AA4BD; font-size:1rem; max-width:520px; line-height:1.65;'>"
+        "StoxAI reads today's news, checks a prediction model's odds, and helps with your "
+        "taxes and portfolio — all through one chat, routed to the right agent automatically.</p>",
+        unsafe_allow_html=True,
+    )
 
-    # --- CHAT TAB ---
-    with tab_chat:
-        col_chat, col_side = st.columns([2, 1])
+    if st.button("Get started", key="home_cta"):
+        st.session_state.page = "login"
+        st.rerun()
 
-        with col_chat:
-            for msg in st.session_state.chat_history:
-                with st.chat_message(msg["role"]):
-                    st.write(msg["content"])
-                    if msg.get("agent"):
-                        st.caption(f"🏷️ {msg['agent']}")
+    st.write("")
 
-            prompt = st.chat_input("Ask about a stock, or how to improve your portfolio...")
-            if prompt:
-                st.session_state.chat_history.append({"role": "user", "content": prompt})
-                with st.spinner("Routing to the right agent..."):
-                    try:
-                        result = send_chat(
-                            token=st.session_state.token,
-                            user_query=prompt,
-                            portfolio=st.session_state.portfolio,
-                            tax_profile=None,
-                            chat_history=st.session_state.chat_history[:-1],
-                        )
-                        answer = result.get("final_response", "(no response)")
-                        intent = result.get("intent", "general")
-                        agent_name, _ = INTENT_TO_AGENT.get(intent, ("Assistant", "#94a3b8"))
-                        st.session_state.chat_history.append(
-                            {"role": "assistant", "content": answer, "agent": agent_name}
-                        )
-                        log_run(intent, headline=answer[:60], detail=f"intent: {intent}")
-                    except RuntimeError as e:
-                        st.session_state.chat_history.append(
-                            {"role": "assistant", "content": f"⚠️ {e}"}
-                        )
-                st.rerun()
+    features = [
+        ("Tax agent", "#34D399", "Answers capital-gains and deduction questions, grounded in your actual profile."),
+        ("Prediction agent", "#60A5FA", "Runs the LSTM+GRU models on your watchlist to estimate direction and confidence."),
+        ("Stock info agent", "#60A5FA", "Ask how any stock is doing right now, in plain language."),
+        ("Watchlist agent", "#E8A33D", "Add stocks by just mentioning them — no separate form needed."),
+        ("Planning agent", "#A78BFA", "Scores your portfolio and suggests rebalancing moves."),
+        ("Report agent", "#A78BFA", "Pulls everything into a summary when you ask for one."),
+    ]
 
-        with col_side:
-            st.markdown("**RECENT RUNS**")
-            if not st.session_state.agent_runs:
-                st.caption("No agent runs yet — ask something in the chat.")
-            for run in st.session_state.agent_runs[:5]:
+    for row_start in range(0, len(features), 3):
+        cols = st.columns(3)
+        for col, (title, color, desc) in zip(cols, features[row_start:row_start + 3]):
+            with col:
                 st.markdown(
-                    f"""<div class="run-card">
-                            <span style="color:{run['color']}; font-weight:700;">{run['agent']}</span><br>
-                            <span style="font-size:0.85rem;">{run['headline']}</span><br>
-                            <span style="color:#64748b; font-size:0.75rem;">{run['ts']} · {run['detail']}</span>
-                        </div>""",
+                    f"""
+                    <div class="sx-panel" style="border-left:3px solid {color};">
+                        <div style="font-size:0.95rem; font-weight:600; color:#F3F5FA; margin-bottom:6px;">{title}</div>
+                        <div style="font-size:0.85rem; color:#9AA4BD; line-height:1.5;">{desc}</div>
+                    </div>
+                    """,
                     unsafe_allow_html=True,
                 )
+        st.write("")
 
-    # --- PORTFOLIO TAB ---
-    with tab_portfolio:
-        st.caption("Holdings here are sent along with every chat query as `portfolio` (see ChatRequest in main.py).")
-        with st.form("add_holding", clear_on_submit=True):
-            c1, c2, c3, c4, c5 = st.columns(5)
-            symbol = c1.text_input("Symbol", placeholder="TCS.NS")
-            qty = c2.number_input("Quantity", min_value=0.0, step=1.0)
-            buy_price = c3.number_input("Buy price", min_value=0.0, step=1.0)
-            current_price = c4.number_input("Current price", min_value=0.0, step=1.0)
-            asset_type = c5.selectbox("Type", ["equity", "mutual_fund", "etf", "bond", "crypto"])
-            buy_date = st.date_input("Buy date")
-            if st.form_submit_button("Add holding", type="primary") and symbol:
-                st.session_state.portfolio.append({
-                    "symbol": symbol.upper(), "quantity": qty, "buy_price": buy_price,
-                    "buy_date": str(buy_date), "current_price": current_price, "asset_type": asset_type,
-                })
-        if st.session_state.portfolio:
-            st.table(st.session_state.portfolio)
-        else:
-            st.info("No holdings added yet.")
 
-    # --- AGENT ACTIVITY TAB ---
-    with tab_activity:
-        st.caption(
-            "This log is built client-side from each /chat response's `intent`. "
-            "It resets on refresh — persist it server-side (e.g. a `runs` "
-            "collection in Mongo) if you want history across sessions/devices."
+def render_login():
+    st.markdown(
+        '<div class="sx-logo"><div class="sx-logo-mark">S</div>'
+        '<div class="sx-logo-text">StoxAI</div></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("← Back to home", key="login_back_home"):
+        st.session_state.page = "home"
+        st.rerun()
+    st.write("")
+
+    _, col, _ = st.columns([1, 1.3, 1])
+    with col:
+        tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
+
+        with tab_login:
+            login_email = st.text_input("Email", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            if st.button("Log in", use_container_width=True, key="login_btn"):
+                if not login_email or not login_password:
+                    st.warning("Enter both email and password.")
+                else:
+                    try:
+                        res = login_request(login_email, login_password)
+                    except requests.RequestException as e:
+                        st.error(f"Couldn't reach the backend at {BACKEND_URL}: {e}")
+                        res = None
+                    if res is not None:
+                        if res.status_code == 200:
+                            _apply_auth_response(res.json())
+                            st.rerun()
+                        else:
+                            detail = res.json().get("detail", "Login failed") if res.headers.get("content-type", "").startswith("application/json") else "Login failed"
+                            st.error(detail)
+
+        with tab_signup:
+            signup_username = st.text_input("Username", key="signup_username")
+            signup_email = st.text_input("Email", key="signup_email")
+            signup_password = st.text_input("Password", type="password", key="signup_password", help="At least 6 characters.")
+            if st.button("Sign up", use_container_width=True, key="signup_btn"):
+                if not signup_username or not signup_email or not signup_password:
+                    st.warning("Fill in username, email, and password.")
+                else:
+                    try:
+                        res = signup_request(signup_username, signup_email, signup_password)
+                    except requests.RequestException as e:
+                        st.error(f"Couldn't reach the backend at {BACKEND_URL}: {e}")
+                        res = None
+                    if res is not None:
+                        if res.status_code == 200:
+                            _apply_auth_response(res.json())
+                            st.rerun()
+                        else:
+                            detail = res.json().get("detail", "Sign up failed") if res.headers.get("content-type", "").startswith("application/json") else "Sign up failed"
+                            st.error(detail)
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+
+def render_dashboard():
+    user = st.session_state.user
+
+    top_l, top_r = st.columns([5, 1])
+    with top_l:
+        st.markdown(
+            '<div class="sx-logo"><div class="sx-logo-mark">S</div>'
+            '<div class="sx-logo-text">StoxAI</div></div>',
+            unsafe_allow_html=True,
         )
-        if not st.session_state.agent_runs:
-            st.info("Nothing has run yet.")
-        for run in st.session_state.agent_runs:
-            st.markdown(
-                f"""<div class="run-card">
-                        <span style="color:{run['color']}; font-weight:700;">{run['agent']}</span>
-                        <span style="color:#64748b; font-size:0.8rem;"> · {run['ts']}</span><br>
-                        <b>{run['headline']}</b><br>
-                        <span style="color:#94a3b8; font-size:0.85rem;">{run['detail']}</span>
-                    </div>""",
-                unsafe_allow_html=True,
-            )
+        st.markdown(f"Welcome back, **{user.get('username') or user.get('email')}**")
+    with top_r:
+        if st.button("Log out", use_container_width=True):
+            for k in ("token", "user", "chat_history", "run_log"):
+                st.session_state[k] = None if k in ("token", "user") else []
+            st.session_state.page = "home"
+            st.rerun()
+
+    with st.sidebar:
+        if user.get("photo"):
+            st.image(user["photo"], width=64)
+        st.write(f"**{user.get('username', 'User')}**")
+        st.caption(user.get("email", ""))
+        st.divider()
+
+        with st.expander("Tax profile (optional)"):
+            st.caption("Sent with every message so the tax agent has real context.")
+            filing_status = st.selectbox("Filing status", ["single", "married_joint", "married_separate", "hoi"])
+            country = st.selectbox("Country", ["IN", "US"])
+            annual_income = st.number_input("Annual income", min_value=0.0, step=1000.0)
+            if st.button("Save tax profile", use_container_width=True):
+                st.session_state.tax_profile = {
+                    "filing_status": filing_status,
+                    "country": country,
+                    "annual_income": annual_income,
+                }
+                st.success("Saved for this session.")
+
+        st.divider()
+        st.markdown("**Your watchlist**")
+        st.caption("Predictions run nightly for whatever's added here.")
+
+        new_tickers = st.text_input("Add tickers (comma-separated)", placeholder="e.g. AAPL, TCS, INFY", key="wl_input")
+        if st.button("Add to watchlist", use_container_width=True):
+            if not new_tickers.strip():
+                st.warning("Enter at least one ticker first.")
+            else:
+                # Real message through the real /chat pipeline — "watchlist" is
+                # one of the exact keywords graph.py's router_node matches to
+                # trigger save_interest_node (see graph.py's router_node).
+                message = f"Add {new_tickers.strip()} to my watchlist"
+                with st.spinner("Updating your watchlist..."):
+                    try:
+                        response = process_chat_turn(message, echo_in_chat=True)
+                    except requests.HTTPError as e:
+                        st.error(f"Backend error: {e.response.status_code} — {e.response.text}")
+                        response = None
+                    except requests.RequestException as e:
+                        st.error(f"Couldn't reach the backend: {e}")
+                        response = None
+
+                if response:
+                    result = response.get("save_interest_result") or {}
+                    if result.get("error"):
+                        st.error(f"Couldn't add that: {result['error']}")
+                    else:
+                        st.success(f"Added: {', '.join(result.get('saved', []))}")
+                        st.rerun()
+
+        if st.session_state.watchlist:
+            for symbol, info in st.session_state.watchlist.items():
+                predicted = info.get("predicted_price")
+                predicted_display = "not predicted yet" if predicted == -1 else predicted
+                st.caption(
+                    f"**{symbol}** — live: {info.get('live_price')} · predicted: {predicted_display}"
+                )
+        else:
+            st.caption("No stocks added yet this session. Add one above, or ask in chat "
+                       "(e.g. \"my favorite stock is TSLA\") — either way triggers the same agent.")
+
+    col_chat, col_details = st.columns([1.5, 1])
+
+    with col_chat:
+        st.markdown("##### Chat")
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        prompt = st.chat_input("Ask about a stock, your portfolio, or your taxes...")
+        if prompt:
+            with st.chat_message("user"):
+                st.write(prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking... (first request can be slow if the backend is waking up)"):
+                    try:
+                        response = process_chat_turn(prompt)
+                    except requests.HTTPError as e:
+                        st.error(f"Backend error: {e.response.status_code} — {e.response.text}")
+                        st.stop()
+                    except requests.RequestException as e:
+                        st.error(f"Couldn't reach the backend: {e}")
+                        st.stop()
+
+                st.write(response.get("final_response", "(no response)"))
+                intent = response.get("intent") or "general"
+                badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
+                st.markdown(
+                    f"<span class='sx-badge {badge_class}'>{INTENT_LABELS.get(intent, intent)}</span>",
+                    unsafe_allow_html=True,
+                )
+            st.rerun()  # refresh so the details panel + watchlist reflect this turn immediately
+
+    with col_details:
+        st.markdown("##### Agent run details")
+        if not st.session_state.run_log:
+            st.caption("Ask something in chat — the agent that handles it, and its actual output, will show here.")
+        else:
+            latest = st.session_state.run_log[0]
+            st.caption(f'"{latest["query"]}" · {latest["ts"]}')
+            render_agent_details(latest["response"])
+
+            if len(st.session_state.run_log) > 1:
+                st.markdown("---")
+                st.caption("Earlier runs")
+                for entry in st.session_state.run_log[1:8]:
+                    intent = entry["response"].get("intent") or "general"
+                    label = INTENT_LABELS.get(intent, intent)
+                    badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
+                    st.markdown(
+                        f"""
+                        <div class="sx-panel">
+                            <span class="sx-badge {badge_class}">{label}</span>
+                            <div class="sx-meta">"{entry['query']}" · {entry['ts']}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # ROUTER
-# --------------------------------------------------------------------------
-if st.session_state.token and st.session_state.user:
+# ---------------------------------------------------------------------------
+
+if st.session_state.user:
     render_dashboard()
+elif st.session_state.page == "login":
+    render_login()
 else:
     render_home()
