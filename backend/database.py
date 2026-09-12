@@ -37,7 +37,7 @@ db = client[config.MONGODB_DB_NAME]
 
 users_collection = db["users"]
 users_collection.create_index("email", unique=True)
-users_collection.create_index("google_id", unique=True)
+#users_collection.create_index("google_id", unique=True)
 
 # Note: rag.py opens its OWN MongoClient against config.MONGODB_URI /
 # MONGODB_DB_NAME / MONGODB_COLLECTION for the vector index - left as-is
