@@ -22,6 +22,7 @@ import hashlib
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import config
@@ -41,7 +42,7 @@ def extract_text(file_path: str) -> str:
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext in (".md", ".txt"):
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
 
     if ext == ".pdf":
@@ -50,38 +51,98 @@ def extract_text(file_path: str) -> str:
     if ext == ".docx":
         return _extract_docx(file_path)
 
-    raise ValueError(f"Unsupported file type: {ext}. Supported: .md, .txt, .pdf, .docx")
+    if ext == ".csv":
+        return _extract_csv(file_path)
+
+    if ext == ".json":
+        return _extract_json(file_path)
+
+    raise ValueError(f"Unsupported file type: {ext}. Supported: .md, .txt, .pdf, .docx, .csv, .json")
+
+
+def _extract_csv(file_path: str) -> str:
+    import csv
+    lines = []
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        reader = csv.reader(f)
+        rows = [row for row in reader if row]
+        if not rows:
+            return ""
+        header = rows[0]
+        lines.append("| " + " | ".join(header) + " |")
+        lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+        for r in rows[1:]:
+            lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
+def _extract_json(file_path: str) -> str:
+    import json
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        data = json.load(f)
+    return json.dumps(data, indent=2)
 
 
 def _extract_pdf(file_path: str) -> str:
-    from pypdf import PdfReader
+    # 1. Try pypdf
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(file_path)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        text = "\n\n".join(pages).strip()
+        if text:
+            return text
+    except Exception as e:
+        logger.warning(f"pypdf extraction failed for {file_path}: {e}")
 
-    reader = PdfReader(file_path)
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n\n".join(pages)
+    # 2. Try PyPDF2
+    try:
+        import PyPDF2
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text = "\n\n".join(pages).strip()
+            if text:
+                return text
+    except Exception as e:
+        logger.warning(f"PyPDF2 extraction failed for {file_path}: {e}")
+
+    # 3. Try pdfplumber
+    try:
+        import pdfplumber
+        with pdfplumber.open(file_path) as pdf:
+            pages = [p.extract_text() or "" for p in pdf.pages]
+            text = "\n\n".join(pages).strip()
+            if text:
+                return text
+    except Exception as e:
+        logger.warning(f"pdfplumber extraction failed for {file_path}: {e}")
+
+    return f"Failed to extract readable text from PDF file: {os.path.basename(file_path)}"
 
 
 def _extract_docx(file_path: str) -> str:
-    import docx
-
-    doc = docx.Document(file_path)
-    parts = []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        # preserve Word heading styles as markdown headers, so the chunker
-        # below still gets section structure
-        style = (para.style.name or "").lower()
-        if style.startswith("heading 1") or style == "title":
-            parts.append(f"# {text}")
-        elif style.startswith("heading 2"):
-            parts.append(f"## {text}")
-        elif style.startswith("heading 3"):
-            parts.append(f"### {text}")
-        else:
-            parts.append(text)
-    return "\n\n".join(parts)
+    try:
+        import docx
+        doc = docx.Document(file_path)
+        parts = []
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if not text:
+                continue
+            style = (para.style.name or "").lower()
+            if style.startswith("heading 1") or style == "title":
+                parts.append(f"# {text}")
+            elif style.startswith("heading 2"):
+                parts.append(f"## {text}")
+            elif style.startswith("heading 3"):
+                parts.append(f"### {text}")
+            else:
+                parts.append(text)
+        return "\n\n".join(parts)
+    except Exception as e:
+        logger.error(f"DOCX extraction error for {file_path}: {e}")
+        raise ValueError(f"Could not read DOCX file {os.path.basename(file_path)}: {e}")
 
 
 # ===========================================================================
@@ -459,7 +520,7 @@ def _slugify(name: str) -> str:
 
 def add_doc(source_path: str, country: str = None, name: str = None):
     """
-    Pre-ingest a single custom file (notes, a tax-rule doc, whatever) into
+    Pre-ingest a single custom file (notes, a tax-rule doc, portfolio, etc.) into
     the RAG corpus: extracts text, writes it as .md into data/tax_docs/,
     and (if country="US") prefixes the filename with "us_" - the existing
     country-inference convention used by the retriever above.
@@ -474,23 +535,34 @@ def add_doc(source_path: str, country: str = None, name: str = None):
     base_name = name or os.path.splitext(os.path.basename(source_path))[0]
     slug = _slugify(base_name)
     prefix = "us_" if country == "US" else ""
-    dest_filename = f"{prefix}{slug}.md"
-    dest_path = os.path.join(config.TAX_DOCS_DIR, dest_filename)
+    
+    target_name = f"{prefix}{slug}.md"
+    dest_path = os.path.join(config.TAX_DOCS_DIR, target_name)
+    if os.path.exists(dest_path):
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        dest_path = os.path.join(config.TAX_DOCS_DIR, f"{prefix}{slug}_{ts}.md")
 
     os.makedirs(config.TAX_DOCS_DIR, exist_ok=True)
-    if os.path.exists(dest_path):
-        raise FileExistsError(
-            f"{dest_path} already exists - pass --name to use a different filename, "
-            f"or delete the existing file first if you're intentionally replacing it."
-        )
-
     with open(dest_path, "w", encoding="utf-8") as f:
         f.write(text)
 
-    print(f"Ingested {source_path}")
-    print(f"  -> {dest_path}  ({len(text)} chars, country={country or 'any'})")
-    print("BM25 will pick this up automatically on the next TaxRAGRetriever() init.")
-    print("If you're also using the FAISS dense index, re-run: python -m rag ingest --backend faiss")
+    # Auto-upsert vector chunks into MongoDB if vector backend is enabled
+    if config.RAG_DENSE_BACKEND == "mongodb" and config.MONGODB_URI:
+        try:
+            chunks = chunk_markdown(text, os.path.basename(dest_path))
+            for c in chunks:
+                c["country"] = country
+            if chunks:
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+                embedder = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL)
+                embeddings = embedder.embed_documents([c["text"] for c in chunks])
+                store = MongoVectorStore()
+                store.upsert_chunks(chunks, embeddings)
+                logger.info("Auto-upserted %d vector chunks to MongoDB Atlas for %s", len(chunks), os.path.basename(dest_path))
+        except Exception as e:
+            logger.warning("Auto-upsert vector chunks to MongoDB skipped/failed: %s", e)
+
+    logger.info("Ingested %s -> %s (%d chars)", source_path, dest_path, len(text))
     return dest_path
 
 

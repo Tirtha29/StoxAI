@@ -197,13 +197,15 @@ def parse_user_query_with_pydantic_llm(user_query: str) -> ParsedUserQuery:
                         "Classify the following user query for a financial assistant app and extract any ticker symbols or company names.\n"
                         "Query: {query}\n\n"
                         "Intent mapping guide:\n"
-                        "- 'stock_info': asking about price, current performance, or prediction for a stock (e.g., 'how is AAPL doing', 'price of Reliance')\n"
+                        "- 'stock_info': asking about price, current performance, graph/chart, or prediction for a stock (e.g., 'how is AAPL doing', 'price of Reliance', 'show me graph about GOOGL')\n"
                         "- 'save_interest': adding/tracking watchlist or favorite stocks (e.g., 'add TSLA to my watchlist', 'favorite stocks are AAPL, MSFT')\n"
                         "- 'portfolio_planning': asking for portfolio evaluation, scoring, or advice on stocks held\n"
                         "- 'stock_prediction': asking specifically for stock predictions or price targets\n"
                         "- 'tax_optimization': asking about saving taxes, 80C, LTCG, capital gains, tax loss harvesting\n"
                         "- 'report': asking for summary report, pdf, or dashboard\n"
                         "- 'general': general questions, news, general finance concepts\n\n"
+                        "CRITICAL: Do NOT extract English verbs or words like 'SHOW', 'TELL', 'GRAPH', 'CHART', 'PAST', 'DAYS', 'TAX', 'STOCK', 'HI' as stock tickers.\n"
+                        "Extract ONLY actual ticker symbols (e.g., GOOGL, AAPL, TSLA, INFY.NS) or clear company names (e.g., Google, Tesla).\n\n"
                         "{format_instructions}\n"
                     ),
                     input_variables=["query"],
@@ -212,6 +214,12 @@ def parse_user_query_with_pydantic_llm(user_query: str) -> ParsedUserQuery:
 
                 chain = prompt | llm | parser
                 res = chain.invoke({"query": user_query})
+                # Filter out obvious stop word false positives from symbols
+                stop_words = {"SHOW", "TELL", "GRAPH", "CHART", "PAST", "DAYS", "PRICE", "TAX", "HI", "HELLO", "STOCK", "STOCKS"}
+                if res.symbols:
+                    res.symbols = [s for s in res.symbols if s.upper() not in stop_words]
+                if res.symbol and res.symbol.upper() in stop_words:
+                    res.symbol = res.symbols[0] if res.symbols else None
                 if res.symbol and not res.symbols:
                     res.symbols = [res.symbol]
                 return res
@@ -219,14 +227,26 @@ def parse_user_query_with_pydantic_llm(user_query: str) -> ParsedUserQuery:
                 logger.warning("parse_user_query_with_pydantic_llm (%s) failed: %s", model, e)
 
     # Heuristic fallback if LLM parser is unavailable
-    query_lower = user_query.lower()
+    query_clean = user_query.strip()
+    query_lower = query_clean.lower()
+    query_upper = query_clean.upper()
     symbols = []
     import re
-    tokens = re.findall(r"\b[A-Za-z0-9\.]{1,10}\b", user_query)
+    tokens = re.findall(r"\b[A-Za-z0-9\.\^]{1,12}\b", query_clean)
+    stop_words = {"SHOW", "TELL", "GRAPH", "CHART", "PAST", "DAYS", "PRICE", "TAX", "TAXES", "HI", "HELLO", "STOCK", "STOCKS", "I", "A", "AN", "THE", "MY", "IS", "ARE", "TO", "IN", "ON", "FOR", "AND", "OR", "ADD", "GET", "SAVE", "SAVINGS"}
+
     for tok in tokens:
         up = tok.upper()
-        if tok.isupper() and len(tok) <= 6 and up not in {"I", "A", "AN", "THE", "MY", "IS", "ARE", "TO", "IN", "ON", "FOR", "AND", "OR", "ADD", "GET"}:
-            symbols.append(up)
+        if up not in stop_words:
+            if up in COMMON_COMPANY_TICKERS:
+                mapped = COMMON_COMPANY_TICKERS[up]
+                if mapped not in symbols:
+                    symbols.append(mapped)
+            elif (tok.isupper() or len(tokens) == 1) and len(up) <= 10 and up not in stop_words:
+                symbols.append(up)
+
+    if not symbols and query_upper in COMMON_COMPANY_TICKERS:
+        symbols.append(COMMON_COMPANY_TICKERS[query_upper])
 
     if any(k in query_lower for k in ["tax", "80c", "deduction", "harvest", "ltcg", "capital gain"]):
         intent = "tax_optimization"
@@ -236,7 +256,7 @@ def parse_user_query_with_pydantic_llm(user_query: str) -> ParsedUserQuery:
         intent = "portfolio_planning"
     elif any(k in query_lower for k in ["predict", "forecast", "price target"]):
         intent = "stock_prediction"
-    elif any(k in query_lower for k in ["how's", "how is", "what about", "price of", "stock"]) or symbols:
+    elif any(k in query_lower for k in ["how's", "how is", "what about", "price of", "stock", "graph", "chart"]) or symbols:
         intent = "stock_info"
     else:
         intent = "general"
@@ -251,19 +271,33 @@ def parse_user_query_with_pydantic_llm(user_query: str) -> ParsedUserQuery:
 
 COMMON_COMPANY_TICKERS = {
     "TESLA": "TSLA",
+    "TSLA": "TSLA",
     "APPLE": "AAPL",
+    "AAPL": "AAPL",
     "MICROSOFT": "MSFT",
+    "MSFT": "MSFT",
     "GOOGLE": "GOOGL",
+    "GOOGL": "GOOGL",
+    "GOOG": "GOOGL",
     "ALPHABET": "GOOGL",
     "AMAZON": "AMZN",
+    "AMZN": "AMZN",
     "NVIDIA": "NVDA",
+    "NVDA": "NVDA",
     "META": "META",
     "FACEBOOK": "META",
     "RELIANCE": "RELIANCE.NS",
     "TATA MOTORS": "TATAMOTORS.NS",
+    "TATAMOTORS": "TATAMOTORS.NS",
     "TCS": "TCS.NS",
     "INFOSYS": "INFY.NS",
+    "INFY": "INFY.NS",
     "HDFC": "HDFCBANK.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "NIFTY": "^NSEI",
+    "NIFTY50": "^NSEI",
+    "NIFTY 50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
 }
 
 

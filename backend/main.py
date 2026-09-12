@@ -31,13 +31,15 @@ Run:
     uvicorn main:app --reload --port 8000
 """
 
+import os
+import tempfile
 from typing import List, Optional
 
 import logging
 
 import bcrypt
 from bson import ObjectId
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -146,17 +148,27 @@ def signup(req: SignupRequest):
     if len(req.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-    if users_collection.find_one({"email": email}):
-        raise HTTPException(status_code=400, detail="An account with this email already exists")
+    try:
+        existing = users_collection.find_one({"email": email})
+        if existing:
+            raise HTTPException(status_code=400, detail="An account with this email already exists")
 
-    user_doc = {
-        "email": email,
-        "username": username,
-        "password_hash": hash_password(req.password),
-        "photo": None,
-    }
-    result = users_collection.insert_one(user_doc)
-    user_id = str(result.inserted_id)
+        user_doc = {
+            "email": email,
+            "username": username,
+            "password_hash": hash_password(req.password),
+            "photo": None,
+            "stocks": {},
+        }
+        result = users_collection.insert_one(user_doc)
+        user_id = str(result.inserted_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Signup exception: %s", e)
+        if "duplicate key" in str(e).lower() or "dup key" in str(e).lower():
+            raise HTTPException(status_code=400, detail="An account with this email already exists")
+        raise HTTPException(status_code=500, detail=f"Database error during signup: {e}")
 
     token = create_jwt_token(user_id=user_id, email=email)
     return AuthResponse(token=token, user_id=user_id, username=username, email=email)
@@ -165,11 +177,13 @@ def signup(req: SignupRequest):
 @app.post("/auth/login", response_model=AuthResponse)
 def login(req: LoginRequest):
     email = req.email.strip().lower()
-    user = users_collection.find_one({"email": email})
+    try:
+        user = users_collection.find_one({"email": email})
+    except Exception as e:
+        logger.error("Login DB lookup failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Database error during login: {e}")
 
     if not user or not user.get("password_hash") or not verify_password(req.password, user["password_hash"]):
-        # deliberately the same error for "no such user" and "wrong password" -
-        # don't leak which one it was
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
     user_id = str(user["_id"])
@@ -210,6 +224,7 @@ class ChatResponse(BaseModel):
     save_interest_result: Optional[dict] = None
     planning_result: Optional[dict] = None
     report_result: Optional[dict] = None
+    agents_executed: Optional[List[str]] = None
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -248,6 +263,7 @@ def chat(req: ChatRequest, current_user: dict = Depends(get_current_user)):
         save_interest_result=result.get("save_interest_result"),
         planning_result=result.get("planning_result"),
         report_result=result.get("report_result"),
+        agents_executed=result.get("agents_executed"),
     )
 
 
@@ -273,3 +289,51 @@ def admin_ingest_news(req: IngestNewsRequest, x_admin_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key header")
 
     return ingest_news_for_symbols(req.symbols)
+
+
+# ===========================================================================
+# User document ingestion route: upload custom portfolios / tax / notes docs
+# ===========================================================================
+
+@app.post("/ingest-user-file")
+def ingest_user_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    filename = file.filename or "uploaded_document"
+    ext = os.path.splitext(filename)[1].lower()
+    allowed_exts = {".pdf", ".docx", ".txt", ".md", ".csv", ".json"}
+    if ext not in allowed_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed types: {', '.join(allowed_exts)}"
+        )
+
+    tmp_dir = tempfile.mkdtemp(prefix="user_upload_")
+    tmp_path = os.path.join(tmp_dir, filename)
+
+    try:
+        with open(tmp_path, "wb") as f:
+            content = file.file.read()
+            f.write(content)
+
+        # Ingest document into RAG corpus
+        from rag import add_doc
+        dest_path = add_doc(tmp_path, country=None, name=os.path.splitext(filename)[0])
+
+        # Reset retriever cache in graph.py so new document is immediately searchable
+        from graph import reset_retriever
+        reset_retriever()
+
+        return {
+            "status": "ok",
+            "filename": filename,
+            "ingested_path": dest_path,
+            "message": f"Document '{filename}' successfully ingested into RAG corpus and is now searchable."
+        }
+    except Exception as e:
+        logger.error("User file ingestion failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"File ingestion failed: {e}")
+    finally:
+        try:
+            os.remove(tmp_path)
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass

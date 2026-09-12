@@ -160,6 +160,9 @@ class AgentState(TypedDict, total=False):
     planning_result: Optional[dict]                  # portfolio-score / "what should I do" suggestions
     report_result: Optional[dict]
 
+    # pipeline execution tracking
+    agents_executed: Optional[List[str]]
+
     # final
     final_response: Optional[str]
 
@@ -337,7 +340,11 @@ def _call_anthropic(suggestions: List[dict], total_savings: float) -> str:
 
 
 def _template_fallback(suggestions: List[dict], total_savings: float) -> str:
-    lines = [f"Found {len(suggestions)} tax-saving opportunity(ies), estimated total savings {total_savings}."]
+    lines = [f"Found {len(suggestions)} tax-saving opportunity(ies), estimated total savings {total_savings:,.2f}."]
     for s in suggestions:
         lines.append(f"- {s['title']}: {s['detail']}")
+        snippets = s.get("source_snippets", [])
+        if snippets:
+            for sn in snippets[:2]:
+                lines.append(f"  * Document reference: {sn[:250]}...")
     return "\n".join(lines)

@@ -66,7 +66,65 @@ def run_tests():
     print("Tax Intent:", tax_result.get("intent"))
     print("Tax Response snippet:", tax_result.get("final_response")[:150])
     assert tax_result.get("intent") == "tax_optimization"
+    assert tax_result.get("tax_result") is not None
     print("PASS: Tax saving RAG agent routing succeeded.\n")
+
+    print("=== TEST 6: Multi-Turn State Leakage & Stopword Ticker Fix ===")
+    # Immediately follow up on same thread with a stock graph query
+    stock_state = {
+        "user_query": "show me the graph for past days about googl",
+        "chat_history": [],
+        "user_id": test_user_id,
+    }
+    multi_turn_res = app.invoke(stock_state, config={"configurable": {"thread_id": "test_thread_1"}})
+    print("Multi-Turn Intent:", multi_turn_res.get("intent"))
+    print("Multi-Turn Tax Result (Must be None):", multi_turn_res.get("tax_result"))
+    print("Multi-Turn Executed Agents:", multi_turn_res.get("agents_executed"))
+    stock_info_2 = multi_turn_res.get("stock_info_result") or {}
+    print("Stock Info Symbol:", stock_info_2.get("symbol"))
+    print("Graph Present:", bool(stock_info_2.get("graph_image_b64")))
+
+    # Assert tax_result was cleared and did NOT leak into this turn!
+    assert multi_turn_res.get("tax_result") is None
+    assert stock_info_2.get("symbol") == "GOOGL"
+    assert stock_info_2.get("graph_image_b64") is not None
+    assert "Graph Visualization Agent" in (multi_turn_res.get("agents_executed") or [])
+    print("PASS: Multi-turn state leakage fixed & GOOGL graph generated correctly.\n")
+
+    print("=== TEST 7: Scheduler Email Functionality ===")
+    from scheduler import send_user_prediction_emails
+    email_res = send_user_prediction_emails()
+    print("Scheduler Email Results:", email_res)
+    print("PASS: Scheduler email sending pipeline executed.\n")
+
+    print("=== TEST 8: Client File Ingestion into RAG Corpus ===")
+    import tempfile
+    from rag import add_doc, TaxRAGRetriever
+    from graph import reset_retriever
+
+    sample_content = """# Custom Client Portfolio & Tax Exemption Notes 2026
+## Special Deduction Section 80CCD
+Client has invested 50,000 INR in National Pension Scheme (NPS) under Section 80CCD(1B) for additional tax savings.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False)
+    tmp.write(sample_content)
+    tmp.close()
+
+    try:
+        dest_path = add_doc(tmp.name, country="IN", name="test_nps_exemption")
+        print("Ingested custom doc to:", dest_path)
+        assert os.path.exists(dest_path)
+
+        reset_retriever()
+        retriever = TaxRAGRetriever()
+        hits = retriever.query("NPS tax savings under section 80CCD", k=2, country="IN")
+        print("RAG Query Hits count for newly ingested doc:", len(hits))
+        assert len(hits) > 0
+        assert "80CCD" in hits[0]["text"]
+        print("PASS: Custom client document ingested and successfully retrieved by RAG agent.\n")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
 
     print("ALL VERIFICATION TESTS PASSED SUCCESSFULLY!")
 

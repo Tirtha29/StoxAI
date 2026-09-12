@@ -112,6 +112,22 @@ st.markdown(
         border-radius: 8px; font-weight: 600;
     }
     section[data-testid="stSidebar"] { background-color: #0D1524; }
+    .stMarkdown table {
+        width: 100% !important;
+        border-collapse: collapse !important;
+        margin: 12px 0 !important;
+        table-layout: auto !important;
+    }
+    .stMarkdown th, .stMarkdown td {
+        border: 1px solid #223052 !important;
+        padding: 8px 12px !important;
+        text-align: left !important;
+        vertical-align: top !important;
+        line-height: 1.5 !important;
+        font-size: 0.88rem !important;
+        word-break: break-word !important;
+        white-space: normal !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -205,9 +221,19 @@ def process_chat_turn(user_message: str, echo_in_chat: bool = True):
     response = send_chat(user_message)
     reply = response.get("final_response", "(no response)")
 
+    stock_info = response.get("stock_info_result") or {}
+    graph_b64 = stock_info.get("graph_image_b64")
+
     if echo_in_chat:
         st.session_state.chat_history.append({"role": "user", "content": user_message})
-        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        asst_msg = {
+            "role": "assistant",
+            "content": reply,
+            "image_b64": graph_b64,
+            "agents_executed": response.get("agents_executed"),
+            "intent": response.get("intent", "general"),
+        }
+        st.session_state.chat_history.append(asst_msg)
 
     st.session_state.run_log.insert(
         0, {"response": response, "query": user_message, "ts": dt.datetime.now().strftime("%H:%M:%S")}
@@ -245,6 +271,16 @@ def render_generic(data):
         st.write(data)
 
 
+import re
+
+def clean_markdown_text(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    # Convert raw html break tags inside tables/markdown to standard newlines
+    cleaned = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    return cleaned
+
+
 def render_tax_result(data: dict):
     """Matches core.py's TaxSavingResponse: suggestions[], total_estimated_savings, explanation."""
     total = data.get("total_estimated_savings")
@@ -252,18 +288,18 @@ def render_tax_result(data: dict):
         st.markdown(f"**Estimated savings: {total:,.2f}**")
     for s in data.get("suggestions", []) or []:
         with st.container():
-            st.markdown(f"**{s.get('title', s.get('type', 'Suggestion'))}**")
+            st.markdown(f"**{clean_markdown_text(s.get('title', s.get('type', 'Suggestion')))}**")
             if s.get("detail"):
-                st.caption(s["detail"])
+                st.markdown(clean_markdown_text(s["detail"]))
             if s.get("estimated_savings"):
                 st.caption(f"Est. savings: {s['estimated_savings']:,.2f}")
             if s.get("source_snippets"):
                 with st.expander("Source snippets (RAG)"):
                     for sn in s["source_snippets"]:
-                        st.caption(f"• {sn}")
+                        st.caption(f"• {clean_markdown_text(sn)}")
     if data.get("explanation"):
         st.markdown("---")
-        st.caption(data["explanation"])
+        st.markdown(clean_markdown_text(data["explanation"]))
 
 
 def render_stock_prediction_result(data: list):
@@ -278,6 +314,20 @@ def render_stock_prediction_result(data: list):
             st.caption(f"Predicted range: {item['predicted_range']}")
         if item.get("explanation"):
             st.caption(item["explanation"])
+
+
+import base64
+
+
+def render_graph_b64(graph_b64: str):
+    if not graph_b64:
+        return
+    try:
+        raw_b64 = graph_b64.split(",", 1)[1] if "," in graph_b64 else graph_b64
+        img_bytes = base64.b64decode(raw_b64)
+        st.image(img_bytes, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error rendering chart: {e}")
 
 
 def render_stock_info_result(data: dict):
@@ -301,14 +351,63 @@ def render_stock_info_result(data: dict):
     graph_b64 = data.get("graph_image_b64")
     if graph_b64:
         st.markdown("**30-Day Performance History**")
-        st.image(graph_b64, use_container_width=True)
+        render_graph_b64(graph_b64)
+
+
+def render_agent_pipeline(agents_executed: list = None, intent: str = "general"):
+    if not agents_executed:
+        label = INTENT_LABELS.get(intent, intent)
+        badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
+        st.markdown(f"<span class='sx-badge {badge_class}'>{label}</span>", unsafe_allow_html=True)
+        return
+
+    html_parts = []
+    for name in agents_executed:
+        badge_cls = "badge-general"
+        if "News" in name:
+            badge_cls = "badge-stock_prediction"
+        elif "Prediction" in name:
+            badge_cls = "badge-stock_info"
+        elif "Stock Info" in name or "Info" in name:
+            badge_cls = "badge-save_interest"
+        elif "Graph" in name or "Visualization" in name:
+            badge_cls = "badge-tax_optimization"
+        elif "Tax" in name:
+            badge_cls = "badge-tax_optimization"
+        elif "Watchlist" in name:
+            badge_cls = "badge-save_interest"
+        elif "Planning" in name:
+            badge_cls = "badge-portfolio_planning"
+
+        html_parts.append(f"<span class='sx-badge {badge_cls}'>{name}</span>")
+
+    separator = " <span style='color:#6B7690; font-size:0.75rem;'>➔</span> "
+    pipeline_html = separator.join(html_parts)
+    st.markdown(f"<div style='margin-top:6px; margin-bottom:6px;'>{pipeline_html}</div>", unsafe_allow_html=True)
+
+
+def render_planning_result(data: dict):
+    if not data or data.get("status") == "need_stock_list":
+        st.caption("No stocks evaluated yet.")
+        return
+    score = data.get("portfolio_score", "N/A")
+    rating = data.get("score_rating", "")
+    st.metric(label="Portfolio Score", value=f"{score} / 100", delta=rating)
+    st.write("**Per-Stock Target Predictions:**")
+    for item in data.get("symbols", []):
+        sym = item.get("symbol")
+        live = item.get("live_price")
+        pred = item.get("predicted_price")
+        pct = item.get("predicted_change_pct")
+        st.markdown(f"**{sym}**: `{live}` ➔ `{pred}` ({pct})")
+        if item.get("explanation"):
+            st.caption(item["explanation"])
 
 
 def render_agent_details(response: dict):
     intent = response.get("intent") or "general"
-    label = INTENT_LABELS.get(intent, intent)
-    badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
-    st.markdown(f"<span class='sx-badge {badge_class}'>{label}</span>", unsafe_allow_html=True)
+    agents_executed = response.get("agents_executed") or []
+    render_agent_pipeline(agents_executed, intent)
     st.write("")
 
     if intent == "tax_optimization" and response.get("tax_result"):
@@ -320,7 +419,7 @@ def render_agent_details(response: dict):
     elif intent == "save_interest" and response.get("save_interest_result"):
         render_generic(response["save_interest_result"])
     elif intent == "portfolio_planning" and response.get("planning_result"):
-        render_generic(response["planning_result"])
+        render_planning_result(response["planning_result"])
     elif intent == "report" and response.get("report_result"):
         render_generic(response["report_result"])
     else:
@@ -428,9 +527,12 @@ def render_login():
         tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
 
         with tab_login:
-            login_email = st.text_input("Email", key="login_email")
-            login_password = st.text_input("Password", type="password", key="login_password")
-            if st.button("Log in", use_container_width=True, key="login_btn"):
+            with st.form(key="login_form"):
+                login_email = st.text_input("Email Address", key="login_email_val")
+                login_password = st.text_input("Password", type="password", key="login_password_val")
+                submitted_login = st.form_submit_button("Log in", use_container_width=True)
+
+            if submitted_login:
                 if not login_email or not login_password:
                     st.warning("Enter both email and password.")
                 else:
@@ -448,10 +550,13 @@ def render_login():
                             st.error(detail)
 
         with tab_signup:
-            signup_username = st.text_input("Username", key="signup_username")
-            signup_email = st.text_input("Email", key="signup_email")
-            signup_password = st.text_input("Password", type="password", key="signup_password", help="At least 6 characters.")
-            if st.button("Sign up", use_container_width=True, key="signup_btn"):
+            with st.form(key="signup_form"):
+                signup_username = st.text_input("Username", key="signup_username_val")
+                signup_email = st.text_input("Email Address", key="signup_email_val")
+                signup_password = st.text_input("Password", type="password", key="signup_password_val", help="At least 6 characters.")
+                submitted_signup = st.form_submit_button("Sign up", use_container_width=True)
+
+            if submitted_signup:
                 if not signup_username or not signup_email or not signup_password:
                     st.warning("Fill in username, email, and password.")
                 else:
@@ -496,6 +601,11 @@ def render_dashboard():
             st.image(user["photo"], width=64)
         st.write(f"**{user.get('username', 'User')}**")
         st.caption(user.get("email", ""))
+        if st.button("Clear Chat History", use_container_width=True, key="clear_chat_btn"):
+            st.session_state.chat_history = []
+            st.session_state.run_log = []
+            st.rerun()
+
         st.divider()
 
         with st.expander("Tax profile (optional)"):
@@ -510,6 +620,29 @@ def render_dashboard():
                     "annual_income": annual_income,
                 }
                 st.success("Saved for this session.")
+
+        with st.expander("Ingest document to RAG (PDF, DOCX, CSV, TXT)"):
+            st.caption("Upload your portfolio, tax docs, or financial notes. The RAG agent will read and answer queries about them!")
+            uploaded_doc = st.file_uploader(
+                "Upload file",
+                type=["pdf", "docx", "txt", "md", "csv", "json"],
+                key="rag_file_uploader",
+            )
+            if uploaded_doc is not None:
+                if st.button("Ingest Document", use_container_width=True, key="btn_ingest_doc"):
+                    with st.spinner("Embedding and ingesting document into RAG corpus..."):
+                        try:
+                            files = {"file": (uploaded_doc.name, uploaded_doc.getvalue(), uploaded_doc.type or "application/octet-stream")}
+                            headers = {"Authorization": f"Bearer {st.session_state.token}"}
+                            res = requests.post(f"{BACKEND_URL}/ingest-user-file", files=files, headers=headers, timeout=60)
+                            if res.status_code == 200:
+                                data = res.json()
+                                st.success(data.get("message", "Document ingested successfully!"))
+                            else:
+                                err = res.json().get("detail", "Ingestion failed") if res.headers.get("content-type", "").startswith("application/json") else res.text
+                                st.error(err)
+                        except Exception as e:
+                            st.error(f"Error connecting to backend: {e}")
 
         st.divider()
         st.markdown("**Your watchlist**")
@@ -559,7 +692,9 @@ def render_dashboard():
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
                 if isinstance(msg, dict) and msg.get("image_b64"):
-                    st.image(msg["image_b64"], use_container_width=True)
+                    render_graph_b64(msg["image_b64"])
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    render_agent_pipeline(msg.get("agents_executed"), msg.get("intent", "general"))
 
         prompt = st.chat_input("Ask about a stock, your portfolio, or your taxes...")
         if prompt:
@@ -580,16 +715,9 @@ def render_dashboard():
                 st.write(response.get("final_response", "(no response)"))
                 stock_info = response.get("stock_info_result") or {}
                 if stock_info.get("graph_image_b64"):
-                    st.image(stock_info["graph_image_b64"], use_container_width=True)
-                    if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "assistant":
-                        st.session_state.chat_history[-1]["image_b64"] = stock_info["graph_image_b64"]
+                    render_graph_b64(stock_info["graph_image_b64"])
 
-                intent = response.get("intent") or "general"
-                badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
-                st.markdown(
-                    f"<span class='sx-badge {badge_class}'>{INTENT_LABELS.get(intent, intent)}</span>",
-                    unsafe_allow_html=True,
-                )
+                render_agent_pipeline(response.get("agents_executed"), response.get("intent", "general"))
             st.rerun()  # refresh so the details panel + watchlist reflect this turn immediately
 
     with col_details:
@@ -605,18 +733,16 @@ def render_dashboard():
                 st.markdown("---")
                 st.caption("Earlier runs")
                 for entry in st.session_state.run_log[1:8]:
-                    intent = entry["response"].get("intent") or "general"
-                    label = INTENT_LABELS.get(intent, intent)
-                    badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
+                    resp = entry["response"]
                     st.markdown(
                         f"""
                         <div class="sx-panel">
-                            <span class="sx-badge {badge_class}">{label}</span>
                             <div class="sx-meta">"{entry['query']}" · {entry['ts']}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
+                    render_agent_pipeline(resp.get("agents_executed"), resp.get("intent", "general"))
 
 
 # ---------------------------------------------------------------------------

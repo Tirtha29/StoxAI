@@ -238,14 +238,68 @@ def refresh_news() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# STEP 3: send email alerts to users watching stocks
+# ---------------------------------------------------------------------------
+
+def send_user_prediction_emails() -> dict:
+    """
+    Finds all users with a watchlist in database.users_collection and emails them
+    a summary of predicted prices and expected stock market directions via agents.send_email_api.
+    """
+    from agents import send_email_api, resolve_price
+    users = list(users_collection.find({"stocks": {"$exists": True, "$ne": {}}}, {"email": 1, "username": 1, "stocks": 1}))
+    sent_count = 0
+    statuses = []
+
+    for user_doc in users:
+        user_email = user_doc.get("email")
+        if not user_email:
+            continue
+
+        username = user_doc.get("username") or user_email
+        stocks = user_doc.get("stocks") or {}
+        if not stocks:
+            continue
+
+        lines = [
+            f"Hello {username},",
+            "",
+            "Here is the nightly stock market prediction update for your watchlist:",
+            "",
+        ]
+
+        for symbol, info in stocks.items():
+            resolved = resolve_price(symbol, info)
+            live_price = resolved["live_price"]
+            pred_price = resolved["predicted_price"]
+            direction = "UP" if (pred_price and live_price and pred_price > live_price) else ("DOWN" if (pred_price and live_price and pred_price < live_price) else "FLAT")
+
+            lines.append(f"• {symbol}: Live Price = ${live_price if live_price is not None else 'N/A'} | Predicted Price = ${pred_price if pred_price is not None else 'N/A'} (Expected Direction: {direction})")
+
+        lines.append("")
+        lines.append("Thank you for using StoxAI!")
+
+        subject = "StoxAI Daily Watchlist Prediction Alert"
+        body = "\n".join(lines)
+
+        status = send_email_api(user_email, subject, body)
+        logger.info("Email alert for %s: %s", user_email, status)
+        statuses.append({"email": user_email, "status": status})
+        sent_count += 1
+
+    return {"emails_sent": sent_count, "details": statuses}
+
+
+# ---------------------------------------------------------------------------
 # THE JOB — what actually runs, once, each time this fires
 # ---------------------------------------------------------------------------
 
 def run_daily_job():
     """
-    Two independent steps — neither depends on the other's output, so the
-    order they run in doesn't matter. They're just written top-to-bottom
-    here for readability.
+    Three steps:
+    1. News ingestion
+    2. Stock price predictions
+    3. Email alert notifications to users
     """
     logger.info("=== Nightly refresh started ===")
 
@@ -272,8 +326,12 @@ def run_daily_job():
         logger.info("No user has any stored favorites yet — skipping prediction refresh.")
         prediction_results = {"succeeded": [], "failed": [], "skipped": True}
 
+    # --- Email Alerts: send email summaries to users watching stocks ---
+    email_results = send_user_prediction_emails()
+    logger.info("Email notifications: %d email(s) processed", email_results.get("emails_sent", 0))
+
     logger.info("=== Nightly refresh finished ===")
-    return {"predictions": prediction_results, "news": news_results}
+    return {"predictions": prediction_results, "news": news_results, "emails": email_results}
 
 
 # ---------------------------------------------------------------------------
