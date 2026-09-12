@@ -63,7 +63,7 @@ st.set_page_config(page_title="StoxAI", page_icon="S", layout="wide")
 # ---------------------------------------------------------------------------
 
 try:
-    BACKEND_URL = st.secrets["BACKEND_URL"]
+    BACKEND_URL = st.secrets["API_BASE_URL"]
 except Exception:
     BACKEND_URL = "http://localhost:8000"  # local dev fallback
 
