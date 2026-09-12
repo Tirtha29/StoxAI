@@ -117,21 +117,19 @@ _TICKER_STOPWORDS = {
 
 def _extract_symbols(text: str) -> List[str]:
     """
-    Heuristic ticker extraction: comma/space separated all-caps tokens,
-    1-6 letters, minus common stopwords. Good enough for a hackathon demo;
-    swap for a Groq extraction call (build a one-line `_llm_extract_symbols`
-    using agents' ChatGroq pattern) if you need to handle lowercase input
-    or company names like "Tesla" reliably.
+    Heuristic ticker extraction: comma/space separated tokens,
+    mapped through COMMON_COMPANY_TICKERS for company names like 'Tesla' or 'Reliance'.
     """
-    candidates = re.findall(r"\b[A-Za-z]{1,6}\b", text)
+    candidates = re.findall(r"\b[A-Za-z0-9\.]{1,12}\b", text)
     seen, symbols = set(), []
     for tok in candidates:
         up = tok.upper()
         if up in _TICKER_STOPWORDS or up in seen:
             continue
-        if tok.isupper() or len(tok) <= 5:  # allow "tsla" typed lowercase too
-            seen.add(up)
-            symbols.append(up)
+        mapped = agents.COMMON_COMPANY_TICKERS.get(up, up)
+        if mapped not in seen and mapped not in _TICKER_STOPWORDS:
+            seen.add(mapped)
+            symbols.append(mapped)
     return symbols
 
 
@@ -211,24 +209,25 @@ def router_node(state: AgentState) -> dict:
     if state.get("pending_action") == "await_stock_list":
         return {"intent": "save_interest"}
 
-    query = state.get("user_query", "").lower()
+    query = state.get("user_query", "")
+    parsed = agents.parse_user_query_with_pydantic_llm(query)
+    intent = parsed.intent
+    symbols = parsed.symbols
 
-    if any(k in query for k in ["tax", "80c", "deduction", "harvest", "ltcg", "capital gain"]):
-        intent = "tax_optimization"
-    elif any(k in query for k in ["favorite stock", "favourite stock", "interested in", "watch ", "track ", "watchlist"]):
-        intent = "save_interest"
-    elif any(k in query for k in ["portfolio score", "improve my portfolio", "more profit", "which stocks should i", "how to profit"]):
-        intent = "portfolio_planning"
-    elif any(k in query for k in ["predict", "forecast", "price target"]):
-        intent = "stock_prediction"
-    elif any(k in query for k in ["how's", "how is", "what about", "doing today", "going up", "going down", "price of"]) or _extract_symbols(state.get("user_query", "")):
-        intent = "stock_info"
-    elif any(k in query for k in ["report", "summary", "pdf", "dashboard"]):
-        intent = "report"
-    else:
-        intent = "general"
+    if not symbols:
+        # Check if Tavily symbol resolution can discover ticker from company/query
+        if parsed.is_stock_query or parsed.company_or_stock_name or intent in ("stock_info", "save_interest", "stock_prediction"):
+            lookup_target = parsed.company_or_stock_name or query
+            tavily_syms = agents.resolve_stock_symbol_via_tavily(lookup_target)
+            if tavily_syms:
+                symbols = tavily_syms
+                if intent == "general":
+                    intent = "stock_info"
 
-    return {"intent": intent}
+    if not symbols:
+        symbols = _extract_symbols(query)
+
+    return {"intent": intent, "parsed_symbols": symbols}
 
 
 def route_after_router(state: AgentState) -> str:
@@ -273,7 +272,7 @@ def tax_saving_node(state: AgentState) -> dict:
 
 def stock_prediction_node(state: AgentState) -> dict:
     portfolio_raw = state.get("portfolio", [])
-    symbols = [h["symbol"] for h in portfolio_raw] if portfolio_raw else _extract_symbols(state.get("user_query", ""))
+    symbols = [h["symbol"] for h in portfolio_raw] if portfolio_raw else state.get("parsed_symbols") or _extract_symbols(state.get("user_query", ""))
 
     results = []
     for symbol in symbols:
@@ -293,16 +292,13 @@ def stock_prediction_node(state: AgentState) -> dict:
             symbol=pred["ticker"],
             predicted_direction=pred["direction"],
             predicted_range=[pred["last_close"], pred["predicted_price"]],
-            confidence=0.0,  # the LSTM/GRU models don't emit a calibrated confidence score
+            confidence=0.0,
             explanation=(
                 f"Last close {pred['last_close']}, model predicts {pred['direction']} "
                 f"{abs(pred['predicted_pct_change'])}% to {pred['predicted_price']}."
             ),
         ))
 
-        # if this symbol is on the user's watchlist, refresh the cached
-        # prediction so planning_node/stock_info_node stop hitting the -1
-        # sentinel for it next time
         user_id = state.get("user_id")
         if user_id:
             try:
@@ -314,16 +310,14 @@ def stock_prediction_node(state: AgentState) -> dict:
 
 
 # ===========================================================================
-# SECTION 6: Stock info node - "how's TICKER doing" for one symbol
-#
-# No news fetch here anymore - live price + prediction only. If the
-# symbol is already on the user's watchlist, the -1 sentinel rule is
-# honored via agents.resolve_price(); otherwise this runs a fresh
-# prediction, same as before.
+# SECTION 6: Stock info node - Live Price + Predicting Agent + Graph Making Agent
 # ===========================================================================
 
 def stock_info_node(state: AgentState) -> dict:
-    symbols = _extract_symbols(state.get("user_query", ""))
+    symbols = state.get("parsed_symbols") or _extract_symbols(state.get("user_query", ""))
+    if not symbols:
+        symbols = agents.resolve_stock_symbol_via_tavily(state.get("user_query", ""))
+
     if not symbols:
         return {"stock_info_result": {"error": "no ticker found in the message"}}
 
@@ -347,18 +341,26 @@ def stock_info_node(state: AgentState) -> dict:
 
         try:
             pred = agents.predict_stock(symbol)
-            info["predicted_price"] = pred["predicted_price"]
-            info["direction"] = pred["direction"]
+            info["predicted_price"] = pred.get("predicted_price")
+            info["direction"] = pred.get("direction")
         except Exception as e:
             info["predicted_price"] = None
             info["prediction_error"] = str(e)
+
+    # Sentinel Check: If predicted price is -1 or None, send current live price (never -1)
+    if info.get("predicted_price") is None or info.get("predicted_price") == config.NO_PREDICTION_SENTINEL:
+        info["predicted_price"] = info.get("live_price")
+
+    # Invoke Graph Making Agent
+    graph_res = agents.generate_stock_graph(symbol, days=30)
+    info["graph_image_b64"] = graph_res.get("graph_image_b64")
+    info["data_points"] = graph_res.get("data_points", [])
 
     return {"stock_info_result": info}
 
 
 # ===========================================================================
 # SECTION 7: Save-interest node - persists the user's watchlist
-# (now stored on their own `users` document - see agents.py / database.py)
 # ===========================================================================
 
 def save_interest_node(state: AgentState) -> dict:
@@ -366,10 +368,11 @@ def save_interest_node(state: AgentState) -> dict:
     if not user_id:
         return {"save_interest_result": {"error": "not authenticated - no user_id in state"}, "pending_action": None}
 
-    symbols = _extract_symbols(state.get("user_query", ""))
+    symbols = state.get("parsed_symbols") or _extract_symbols(state.get("user_query", ""))
     if not symbols:
-        # user was asked for a list and didn't give one we could parse -
-        # keep pending_action set so we ask again next turn
+        symbols = agents.resolve_stock_symbol_via_tavily(state.get("user_query", ""))
+
+    if not symbols:
         return {"save_interest_result": {"error": "no tickers found"}}
 
     watchlist = agents.store_user_stocks(user_id, symbols)
@@ -378,11 +381,6 @@ def save_interest_node(state: AgentState) -> dict:
 
 # ===========================================================================
 # SECTION 8: Portfolio planning node
-#
-# No news fetch, no email. Per-symbol price comes from
-# agents.resolve_price() (honors the -1 "not predicted yet" sentinel by
-# falling back to a live price), then an LLM pass turns (symbol + price)
-# into a short plain-language note.
 # ===========================================================================
 
 PLANNING_SYSTEM_PROMPT = """You are the planning layer of a stock-watchlist \
@@ -396,6 +394,8 @@ def _plan_for_symbol(symbol: str, cached: dict) -> dict:
     resolved = agents.resolve_price(symbol, cached)
     live_price = resolved["live_price"]
     predicted_price = resolved["predicted_price"]
+    if predicted_price is None or predicted_price == config.NO_PREDICTION_SENTINEL:
+        predicted_price = live_price
     source = resolved["source"]
 
     prompt = (
@@ -435,7 +435,7 @@ def planning_node(state: AgentState) -> dict:
 
 
 # ===========================================================================
-# SECTION 9: Report generation (still a stub - unchanged scope of this merge)
+# SECTION 9: Report generation
 # ===========================================================================
 
 def report_generation_node(state: AgentState) -> dict:
@@ -455,11 +455,13 @@ def chatbot_response_node(state: AgentState) -> dict:
     if state.get("stock_info_result"):
         info = state["stock_info_result"]
         if info.get("error"):
-            parts.append("I couldn't find a ticker in that message - try something like \"how's AAPL doing?\".")
+            parts.append("I couldn't find a ticker in that message - try asking about any stock like \"how's AAPL doing?\".")
         else:
-            line = f"{info['symbol']}: live price {info.get('live_price', 'n/a')}"
+            line = f"**{info['symbol']}** — Live Price: {info.get('live_price', 'n/a')}"
             if info.get("predicted_price"):
-                line += f", model predicts {info.get('direction', '')} to {info['predicted_price']}".rstrip()
+                line += f" · Predicted Price: {info.get('predicted_price')}"
+            if info.get("direction"):
+                line += f" ({info.get('direction')})"
             parts.append(line)
 
     if state.get("save_interest_result"):
@@ -493,10 +495,8 @@ def chatbot_response_node(state: AgentState) -> dict:
         parts.append(f"Full report: {state['report_result']['report_url']}")
 
     if not parts:
-        # "general" intent (or every specialized node came back empty) -
-        # answer from the model's own general knowledge instead of a flat
-        # "I don't understand" message.
-        answer = _general_llm_answer(state.get("user_query", ""), state.get("chat_history"))
+        # General intent or unhandled query -> Tavily general search + LLM fallback
+        answer = agents.tavily_general_search_answer(state.get("user_query", ""), state.get("chat_history"))
         parts.append(answer or (
             "I don't have a live data source for that yet, so I can't verify current "
             "facts here - but generally speaking: "

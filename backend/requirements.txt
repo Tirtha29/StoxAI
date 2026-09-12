@@ -27,6 +27,8 @@ rank-bm25
 sentence-transformers
 langchain-community
 faiss-cpu
+tavily-python
+matplotlib
 
 # optional, only needed if you set CHECKPOINTER_BACKEND=sqlite
 # langgraph-checkpoint-sqlite

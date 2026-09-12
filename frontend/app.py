@@ -280,6 +280,30 @@ def render_stock_prediction_result(data: list):
             st.caption(item["explanation"])
 
 
+def render_stock_info_result(data: dict):
+    """Renders stock info including live price, predicted price (non-negative), and graph."""
+    if not data or data.get("error"):
+        st.warning(data.get("error", "No stock information available."))
+        return
+
+    symbol = data.get("symbol", "?")
+    live_price = data.get("live_price")
+    predicted_price = data.get("predicted_price")
+    if predicted_price == -1 or predicted_price is None:
+        predicted_price = live_price
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(label=f"{symbol} Live Price", value=f"${live_price:,.2f}" if live_price is not None else "N/A")
+    with col2:
+        st.metric(label=f"{symbol} Predicted Price", value=f"${predicted_price:,.2f}" if predicted_price is not None else "N/A")
+
+    graph_b64 = data.get("graph_image_b64")
+    if graph_b64:
+        st.markdown("**30-Day Performance History**")
+        st.image(graph_b64, use_container_width=True)
+
+
 def render_agent_details(response: dict):
     intent = response.get("intent") or "general"
     label = INTENT_LABELS.get(intent, intent)
@@ -292,7 +316,7 @@ def render_agent_details(response: dict):
     elif intent == "stock_prediction" and response.get("stock_prediction_result"):
         render_stock_prediction_result(response["stock_prediction_result"])
     elif intent == "stock_info" and response.get("stock_info_result"):
-        render_generic(response["stock_info_result"])
+        render_stock_info_result(response["stock_info_result"])
     elif intent == "save_interest" and response.get("save_interest_result"):
         render_generic(response["save_interest_result"])
     elif intent == "portfolio_planning" and response.get("planning_result"):
@@ -496,9 +520,6 @@ def render_dashboard():
             if not new_tickers.strip():
                 st.warning("Enter at least one ticker first.")
             else:
-                # Real message through the real /chat pipeline — "watchlist" is
-                # one of the exact keywords graph.py's router_node matches to
-                # trigger save_interest_node (see graph.py's router_node).
                 message = f"Add {new_tickers.strip()} to my watchlist"
                 with st.spinner("Updating your watchlist..."):
                     try:
@@ -521,9 +542,10 @@ def render_dashboard():
         if st.session_state.watchlist:
             for symbol, info in st.session_state.watchlist.items():
                 predicted = info.get("predicted_price")
-                predicted_display = "not predicted yet" if predicted == -1 else predicted
+                live = info.get("live_price")
+                predicted_display = live if (predicted == -1 or predicted is None) else predicted
                 st.caption(
-                    f"**{symbol}** — live: {info.get('live_price')} · predicted: {predicted_display}"
+                    f"**{symbol}** — live: {live} · predicted: {predicted_display}"
                 )
         else:
             st.caption("No stocks added yet this session. Add one above, or ask in chat "
@@ -536,6 +558,8 @@ def render_dashboard():
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
+                if isinstance(msg, dict) and msg.get("image_b64"):
+                    st.image(msg["image_b64"], use_container_width=True)
 
         prompt = st.chat_input("Ask about a stock, your portfolio, or your taxes...")
         if prompt:
@@ -554,6 +578,12 @@ def render_dashboard():
                         st.stop()
 
                 st.write(response.get("final_response", "(no response)"))
+                stock_info = response.get("stock_info_result") or {}
+                if stock_info.get("graph_image_b64"):
+                    st.image(stock_info["graph_image_b64"], use_container_width=True)
+                    if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "assistant":
+                        st.session_state.chat_history[-1]["image_b64"] = stock_info["graph_image_b64"]
+
                 intent = response.get("intent") or "general"
                 badge_class = f"badge-{intent}" if intent in INTENT_LABELS else "badge-general"
                 st.markdown(
