@@ -111,6 +111,24 @@ class ReportBundle(BaseModel):
     sections: List[str] = Field(default_factory=list)
 
 
+# --- Pydantic model for user query structured extraction ---
+
+class ParsedUserQuery(BaseModel):
+    intent: Literal[
+        "stock_info",
+        "tax_optimization",
+        "save_interest",
+        "portfolio_planning",
+        "stock_prediction",
+        "report",
+        "general",
+    ] = "general"
+    symbol: Optional[str] = Field(default=None, description="Single stock ticker if present, e.g. AAPL, TSLA, INFY.NS")
+    symbols: List[str] = Field(default_factory=list, description="List of stock tickers extracted from query")
+    company_or_stock_name: Optional[str] = Field(default=None, description="Company/stock name if explicit symbol is missing, e.g., 'Tesla', 'Reliance'")
+    is_stock_query: bool = Field(default=False, description="True if query is asking about a stock price, performance, prediction, or watchlist")
+
+
 # --- Shared LangGraph state - THE central object passed between every node ---
 
 class AgentState(TypedDict, total=False):
