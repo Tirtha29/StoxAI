@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 pymongo
+# Keep the TLS stack compatible with pyOpenSSL/service-identity in Conda base.
+cryptography>=45.0.7,<47
 python-dotenv
 pyjwt
 httpx

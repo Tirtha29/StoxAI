@@ -61,7 +61,7 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "auth_app")
 
 # RAG vector-search collection/index (rag.py talks to these directly)
-MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "agenticvectordb")
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "tax_rag_chunks")
 MONGODB_VECTOR_INDEX = os.getenv("MONGODB_VECTOR_INDEX", "vector_index")
 
 # ===========================================================================
