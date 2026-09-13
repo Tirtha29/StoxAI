@@ -111,6 +111,24 @@ class ReportBundle(BaseModel):
     sections: List[str] = Field(default_factory=list)
 
 
+# --- Pydantic model for user query structured extraction ---
+
+class ParsedUserQuery(BaseModel):
+    intent: Literal[
+        "stock_info",
+        "tax_optimization",
+        "save_interest",
+        "portfolio_planning",
+        "stock_prediction",
+        "report",
+        "general",
+    ] = "general"
+    symbol: Optional[str] = Field(default=None, description="Single stock ticker if present, e.g. AAPL, TSLA, INFY.NS")
+    symbols: List[str] = Field(default_factory=list, description="List of stock tickers extracted from query")
+    company_or_stock_name: Optional[str] = Field(default=None, description="Company/stock name if explicit symbol is missing, e.g., 'Tesla', 'Reliance'")
+    is_stock_query: bool = Field(default=False, description="True if query is asking about a stock price, performance, prediction, or watchlist")
+
+
 # --- Shared LangGraph state - THE central object passed between every node ---
 
 class AgentState(TypedDict, total=False):
@@ -141,6 +159,9 @@ class AgentState(TypedDict, total=False):
     save_interest_result: Optional[dict]             # watchlist after a save_interest turn
     planning_result: Optional[dict]                  # portfolio-score / "what should I do" suggestions
     report_result: Optional[dict]
+
+    # pipeline execution tracking
+    agents_executed: Optional[List[str]]
 
     # final
     final_response: Optional[str]
@@ -319,7 +340,11 @@ def _call_anthropic(suggestions: List[dict], total_savings: float) -> str:
 
 
 def _template_fallback(suggestions: List[dict], total_savings: float) -> str:
-    lines = [f"Found {len(suggestions)} tax-saving opportunity(ies), estimated total savings {total_savings}."]
+    lines = [f"Found {len(suggestions)} tax-saving opportunity(ies), estimated total savings {total_savings:,.2f}."]
     for s in suggestions:
         lines.append(f"- {s['title']}: {s['detail']}")
+        snippets = s.get("source_snippets", [])
+        if snippets:
+            for sn in snippets[:2]:
+                lines.append(f"  * Document reference: {sn[:250]}...")
     return "\n".join(lines)

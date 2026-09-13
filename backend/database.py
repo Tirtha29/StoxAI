@@ -36,8 +36,12 @@ client = MongoClient(config.MONGODB_URI)
 db = client[config.MONGODB_DB_NAME]
 
 users_collection = db["users"]
-users_collection.create_index("email", unique=True)
-#users_collection.create_index("google_id", unique=True)
+try:
+    users_collection.create_index("email", unique=True, sparse=True)
+    if "google_id_1" in [idx.get("name") for idx in users_collection.list_indexes()]:
+        users_collection.drop_index("google_id_1")
+except Exception as e:
+    pass
 
 # Note: rag.py opens its OWN MongoClient against config.MONGODB_URI /
 # MONGODB_DB_NAME / MONGODB_COLLECTION for the vector index - left as-is

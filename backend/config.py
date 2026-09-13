@@ -61,7 +61,7 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "auth_app")
 
 # RAG vector-search collection/index (rag.py talks to these directly)
-MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "agenticvectordb")
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "tax_rag_chunks")
 MONGODB_VECTOR_INDEX = os.getenv("MONGODB_VECTOR_INDEX", "vector_index")
 
 # ===========================================================================
@@ -71,10 +71,12 @@ MONGODB_VECTOR_INDEX = os.getenv("MONGODB_VECTOR_INDEX", "vector_index")
 # ===========================================================================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
-LLM_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # core.py / graph.py call this LLM_API_KEY
-LLM_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+LLM_API_KEY = os.getenv("GROQ_API_KEY")  # core.py / graph.py call this LLM_API_KEY
+LLM_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 # ===========================================================================
 # Email - Brevo ONLY. No SMTP/SendGrid/Mailgun fallback chain anymore.

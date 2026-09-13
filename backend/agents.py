@@ -22,6 +22,7 @@ news_agent.py's module docstring and main.py's /admin/ingest-news route.
 
 import logging
 from datetime import datetime, timezone
+from typing import List, Optional, Literal, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -133,24 +134,11 @@ def resolve_price(symbol: str, cached: dict) -> dict:
     watchlist: {"live_price": ..., "predicted_price": ..., "updated_at": ...}.
 
     Rule: if predicted_price is config.NO_PREDICTION_SENTINEL (-1), it
-    means "not predicted yet" - fetch a fresh live price instead of
-    treating -1 as a real number. Otherwise trust the cached prediction
-    (and cached live_price alongside it) so we're not re-running the
-    LSTM/GRU models or hitting yfinance on every turn.
-
-    Returns {"price": float|None, "predicted_price": float|None,
-    "source": "cached_prediction"|"live_price_only", "live_price": float|None}.
+    means "not predicted yet" - send current live price as predicted price
+    so -1 is NEVER sent to the frontend.
     """
     cached = cached or {}
     predicted_price = cached.get("predicted_price", config.NO_PREDICTION_SENTINEL)
-
-    if predicted_price is not None and predicted_price != config.NO_PREDICTION_SENTINEL:
-        return {
-            "price": predicted_price,
-            "predicted_price": predicted_price,
-            "live_price": cached.get("live_price"),
-            "source": "cached_prediction",
-        }
 
     try:
         live_price = get_live_price(symbol)
@@ -158,12 +146,347 @@ def resolve_price(symbol: str, cached: dict) -> dict:
         logger.warning("resolve_price: get_live_price(%s) failed: %s", symbol, e)
         live_price = cached.get("live_price")
 
+    if predicted_price is not None and predicted_price != config.NO_PREDICTION_SENTINEL:
+        eff_predicted = predicted_price
+        source = "cached_prediction"
+    else:
+        # User requirement: if predicted price is -1, send the current live price!
+        eff_predicted = live_price
+        source = "live_price_fallback"
+
     return {
-        "price": live_price,
-        "predicted_price": None,
+        "price": eff_predicted,
+        "predicted_price": eff_predicted,
         "live_price": live_price,
-        "source": "live_price_only",
+        "source": source,
     }
+
+
+# ===========================================================================
+# SECTION 1B: Pydantic Query Parsing, Tavily Symbol Extraction & Graphing Agent
+# ===========================================================================
+
+import io
+import base64
+from core import ParsedUserQuery
+
+
+def parse_user_query_with_pydantic_llm(user_query: str) -> ParsedUserQuery:
+    """
+    Uses LLM with Pydantic output parsing to extract query intent, stock symbols,
+    company names, or tax saving intent from the user prompt.
+    """
+    if not user_query or not user_query.strip():
+        return ParsedUserQuery(intent="general")
+
+    if config.GROQ_API_KEY:
+        models_to_try = [config.GROQ_MODEL, "openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.6-27b"]
+        for model in models_to_try:
+            if not model:
+                continue
+            try:
+                from langchain_groq import ChatGroq
+                from langchain_core.output_parsers import PydanticOutputParser
+                from langchain_core.prompts import PromptTemplate
+
+                parser = PydanticOutputParser(pydantic_object=ParsedUserQuery)
+                llm = ChatGroq(api_key=config.GROQ_API_KEY, model=model, temperature=0.0)
+
+                prompt = PromptTemplate(
+                    template=(
+                        "Classify the following user query for a financial assistant app and extract any ticker symbols or company names.\n"
+                        "Query: {query}\n\n"
+                        "Intent mapping guide:\n"
+                        "- 'stock_info': asking about price, current performance, graph/chart, or prediction for a stock (e.g., 'how is AAPL doing', 'price of Reliance', 'show me graph about GOOGL')\n"
+                        "- 'save_interest': adding/tracking watchlist or favorite stocks (e.g., 'add TSLA to my watchlist', 'favorite stocks are AAPL, MSFT')\n"
+                        "- 'portfolio_planning': asking for portfolio evaluation, scoring, or advice on stocks held\n"
+                        "- 'stock_prediction': asking specifically for stock predictions or price targets\n"
+                        "- 'tax_optimization': asking about saving taxes, 80C, LTCG, capital gains, tax loss harvesting\n"
+                        "- 'report': asking for summary report, pdf, or dashboard\n"
+                        "- 'general': general questions, news, general finance concepts\n\n"
+                        "CRITICAL: Do NOT extract English verbs or words like 'SHOW', 'TELL', 'GRAPH', 'CHART', 'PAST', 'DAYS', 'TAX', 'STOCK', 'HI' as stock tickers.\n"
+                        "Extract ONLY actual ticker symbols (e.g., GOOGL, AAPL, TSLA, INFY.NS) or clear company names (e.g., Google, Tesla).\n\n"
+                        "{format_instructions}\n"
+                    ),
+                    input_variables=["query"],
+                    partial_variables={"format_instructions": parser.get_format_instructions()},
+                )
+
+                chain = prompt | llm | parser
+                res = chain.invoke({"query": user_query})
+                # Filter out obvious stop word false positives from symbols
+                stop_words = {"SHOW", "TELL", "GRAPH", "CHART", "PAST", "DAYS", "PRICE", "TAX", "HI", "HELLO", "STOCK", "STOCKS"}
+                if res.symbols:
+                    res.symbols = [s for s in res.symbols if s.upper() not in stop_words]
+                if res.symbol and res.symbol.upper() in stop_words:
+                    res.symbol = res.symbols[0] if res.symbols else None
+                if res.symbol and not res.symbols:
+                    res.symbols = [res.symbol]
+                return res
+            except Exception as e:
+                logger.warning("parse_user_query_with_pydantic_llm (%s) failed: %s", model, e)
+
+    # Heuristic fallback if LLM parser is unavailable
+    query_clean = user_query.strip()
+    query_lower = query_clean.lower()
+    query_upper = query_clean.upper()
+    symbols = []
+    import re
+    tokens = re.findall(r"\b[A-Za-z0-9\.\^]{1,12}\b", query_clean)
+    stop_words = {"SHOW", "TELL", "GRAPH", "CHART", "PAST", "DAYS", "PRICE", "TAX", "TAXES", "HI", "HELLO", "STOCK", "STOCKS", "I", "A", "AN", "THE", "MY", "IS", "ARE", "TO", "IN", "ON", "FOR", "AND", "OR", "ADD", "GET", "SAVE", "SAVINGS"}
+
+    for tok in tokens:
+        up = tok.upper()
+        if up not in stop_words:
+            if up in COMMON_COMPANY_TICKERS:
+                mapped = COMMON_COMPANY_TICKERS[up]
+                if mapped not in symbols:
+                    symbols.append(mapped)
+            elif (tok.isupper() or len(tokens) == 1) and len(up) <= 10 and up not in stop_words:
+                symbols.append(up)
+
+    if not symbols and query_upper in COMMON_COMPANY_TICKERS:
+        symbols.append(COMMON_COMPANY_TICKERS[query_upper])
+
+    if any(k in query_lower for k in ["tax", "80c", "deduction", "harvest", "ltcg", "capital gain"]):
+        intent = "tax_optimization"
+    elif any(k in query_lower for k in ["favorite stock", "favourite stock", "interested in", "watch ", "track ", "watchlist"]):
+        intent = "save_interest"
+    elif any(k in query_lower for k in ["portfolio score", "improve my portfolio", "more profit"]):
+        intent = "portfolio_planning"
+    elif any(k in query_lower for k in ["predict", "forecast", "price target"]):
+        intent = "stock_prediction"
+    elif any(k in query_lower for k in ["how's", "how is", "what about", "price of", "stock", "graph", "chart"]) or symbols:
+        intent = "stock_info"
+    else:
+        intent = "general"
+
+    return ParsedUserQuery(
+        intent=intent,
+        symbol=symbols[0] if symbols else None,
+        symbols=symbols,
+        is_stock_query=(intent in ["stock_info", "stock_prediction", "save_interest"]),
+    )
+
+
+COMMON_COMPANY_TICKERS = {
+    "TESLA": "TSLA",
+    "TSLA": "TSLA",
+    "APPLE": "AAPL",
+    "AAPL": "AAPL",
+    "MICROSOFT": "MSFT",
+    "MSFT": "MSFT",
+    "GOOGLE": "GOOGL",
+    "GOOGL": "GOOGL",
+    "GOOG": "GOOGL",
+    "ALPHABET": "GOOGL",
+    "AMAZON": "AMZN",
+    "AMZN": "AMZN",
+    "NVIDIA": "NVDA",
+    "NVDA": "NVDA",
+    "META": "META",
+    "FACEBOOK": "META",
+    "RELIANCE": "RELIANCE.NS",
+    "TATA MOTORS": "TATAMOTORS.NS",
+    "TATAMOTORS": "TATAMOTORS.NS",
+    "TCS": "TCS.NS",
+    "INFOSYS": "INFY.NS",
+    "INFY": "INFY.NS",
+    "HDFC": "HDFCBANK.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "NIFTY": "^NSEI",
+    "NIFTY50": "^NSEI",
+    "NIFTY 50": "^NSEI",
+    "BANKNIFTY": "^NSEBANK",
+}
+
+
+def resolve_stock_symbol_via_tavily(query_or_name: str) -> List[str]:
+    """
+    If user prompt asks about a stock (e.g. 'Tesla', 'Reliance', 'Tata Motors')
+    without providing an exact ticker symbol, use company map + Tavily web search + LLM to lookup the exact symbol.
+    """
+    if not query_or_name or not query_or_name.strip():
+        return []
+
+    cleaned_name = query_or_name.strip().upper()
+    for name, ticker in COMMON_COMPANY_TICKERS.items():
+        if name in cleaned_name:
+            return [ticker]
+
+    search_query = f"{query_or_name} stock ticker symbol Yahoo Finance"
+    results_text = ""
+
+    # Attempt Tavily search
+    if config.TAVILY_API_KEY:
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=config.TAVILY_API_KEY)
+            res = client.search(query=search_query, max_results=3)
+            results_text = "\n".join([r.get("content", "") for r in res.get("results", [])])
+        except Exception as e:
+            logger.warning("Tavily search failed: %s", e)
+
+    if not results_text:
+        # Fallback to direct HTTP search if Tavily key is missing/failed
+        try:
+            resp = requests.get(
+                "https://query2.finance.yahoo.com/v1/finance/search",
+                params={"q": query_or_name, "quotesCount": 3},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                quotes = resp.json().get("quotes", [])
+                found = [q.get("symbol") for q in quotes if q.get("symbol")]
+                if found:
+                    return found[:2]
+        except Exception as e:
+            logger.warning("Yahoo Finance search fallback failed: %s", e)
+
+    # Use LLM to extract ticker from Tavily results or query
+    if config.GROQ_API_KEY:
+        try:
+            from langchain_groq import ChatGroq
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm = ChatGroq(api_key=config.GROQ_API_KEY, model=config.GROQ_MODEL, temperature=0.0)
+            sys = (
+                "You extract official stock ticker symbols from user text and search results. "
+                "For example: 'Tesla' -> TSLA, 'Apple' -> AAPL, 'Reliance' -> RELIANCE.NS. "
+                "Return ONLY a comma-separated list of valid upper-case stock symbols (e.g. TSLA, RELIANCE.NS, AAPL). "
+                "If no stock symbol is found, return empty string."
+            )
+            prompt = f"User Query: {query_or_name}\nSearch Context:\n{results_text}"
+            resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=prompt)])
+            extracted = resp.content.strip()
+            import re
+            raw_syms = [s.strip().upper() for s in re.split(r"[\s,]+", extracted) if s.strip()]
+            syms = [COMMON_COMPANY_TICKERS.get(s, s) for s in raw_syms]
+            return [s for s in syms if len(s) <= 12]
+        except Exception as e:
+            logger.warning("LLM symbol extraction from Tavily failed: %s", e)
+
+    return []
+
+
+def generate_stock_graph(symbol: str, days: int = 30) -> dict:
+    """
+    Downloads historical performance for `symbol` over past `days` via yfinance,
+    creates a base64 dark-themed PNG graph image and structured data points.
+    """
+    symbol = symbol.strip().upper()
+    try:
+        data = yf.download(symbol, period=f"{days}d")
+        if data.empty:
+            return {"symbol": symbol, "data_points": [], "graph_image_b64": None, "error": "No data returned"}
+
+        if isinstance(data.columns, pd.MultiIndex):
+            # Flatten multi-index columns: keep first level
+            data.columns = [col[0] for col in data.columns]
+
+        data = data.reset_index()
+
+        # Find date column and close column
+        date_col = next((c for c in data.columns if str(c).lower() in ("date", "index")), data.columns[0])
+        close_col = next((c for c in data.columns if "close" in str(c).lower()), "Close")
+
+        data_points = []
+        for _, row in data.iterrows():
+            val = row[date_col]
+            d_str = val.strftime("%Y-%m-%d") if hasattr(val, "strftime") else str(val)[:10]
+            close_val = round(float(row[close_col]), 2)
+            data_points.append({"date": d_str, "close": close_val})
+
+        # Render dark-themed chart using matplotlib
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(7, 3.5), facecolor="#0B1220")
+        ax = plt.gca()
+        ax.set_facecolor("#111A2C")
+
+        dates = [dp["date"] for dp in data_points]
+        closes = [dp["close"] for dp in data_points]
+
+        plt.plot(dates, closes, color="#E8A33D", linewidth=2, label=f"{symbol} Close")
+        plt.fill_between(dates, closes, min(closes)*0.98, color="#E8A33D", alpha=0.15)
+
+        plt.title(f"{symbol} Performance (Past {days} Days)", color="#F3F5FA", fontsize=11, fontweight="bold", pad=10)
+        plt.xlabel("Date", color="#9AA4BD", fontsize=8)
+        plt.ylabel("Price", color="#9AA4BD", fontsize=8)
+
+        # Style ticks and grid
+        ax.tick_params(colors="#9AA4BD", labelsize=7)
+        plt.xticks(rotation=30)
+        ax.spines['bottom'].set_color('#223052')
+        ax.spines['top'].set_color('#223052')
+        ax.spines['right'].set_color('#223052')
+        ax.spines['left'].set_color('#223052')
+        plt.grid(True, linestyle="--", alpha=0.2, color="#223052")
+
+        # Set x-ticks to reasonable frequency
+        if len(dates) > 10:
+            step = max(1, len(dates) // 6)
+            ax.set_xticks(range(0, len(dates), step))
+            ax.set_xticklabels([dates[i] for i in range(0, len(dates), step)])
+
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, facecolor=plt.gcf().get_facecolor(), edgecolor="none")
+        plt.close()
+        buf.seek(0)
+        b64_str = f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
+        return {
+            "symbol": symbol,
+            "data_points": data_points,
+            "graph_image_b64": b64_str,
+            "error": None,
+        }
+
+    except Exception as e:
+        logger.warning("generate_stock_graph failed for %s: %s", symbol, e)
+        return {"symbol": symbol, "data_points": [], "graph_image_b64": None, "error": str(e)}
+
+
+def tavily_general_search_answer(user_query: str, chat_history: list = None) -> Optional[str]:
+    """
+    Fallback for general knowledge queries when no specialized agent handles it.
+    Uses Tavily search to fetch real-time web info and synthesizes response with LLM.
+    """
+    search_context = ""
+    if config.TAVILY_API_KEY:
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=config.TAVILY_API_KEY)
+            res = client.search(query=user_query, max_results=4)
+            search_context = "\n\n".join([f"Source: {r.get('title')}\n{r.get('content')}" for r in res.get("results", [])])
+        except Exception as e:
+            logger.warning("Tavily general search failed: %s", e)
+
+    # Use LLM (Groq or Anthropic) to produce answer
+    prompt = f"User Question: {user_query}\n\n"
+    if search_context:
+        prompt += f"Real-time Web Search Results:\n{search_context}\n\nSummarize the answer clearly based on search results."
+    else:
+        prompt += "Answer concisely based on general knowledge."
+
+    sys_prompt = "You are an intelligent financial and general assistant. Provide accurate, helpful, plain-language answers."
+
+    # Try Groq first for speed
+    if config.GROQ_API_KEY:
+        try:
+            from langchain_groq import ChatGroq
+            from langchain_core.messages import SystemMessage, HumanMessage
+            llm = ChatGroq(api_key=config.GROQ_API_KEY, model=config.GROQ_MODEL, temperature=0.3)
+            resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=prompt)])
+            return resp.content.strip()
+        except Exception as e:
+            logger.warning("Groq general synthesis failed: %s", e)
+
+    return _general_llm_answer(user_query, chat_history)
 
 
 def build_stock_agent():
