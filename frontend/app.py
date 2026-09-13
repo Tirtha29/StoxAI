@@ -84,8 +84,20 @@ st.markdown(
         background-size: 24px 24px;
         color: #E4E8F1;
     }
-    #MainMenu, footer, header {visibility: hidden;}
-    
+    #MainMenu, footer {visibility: hidden;}
+    header[data-testid="stHeader"] { background: transparent; }
+
+    section[data-testid="stSidebar"] {
+        display: block !important;
+        visibility: visible !important;
+        transform: none !important;
+        min-width: 21rem !important;
+        width: 21rem !important;
+        margin-left: 0px !important;
+    }
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapseButton"],
+    button[kind="header"] { display: none !important; }
     .sx-logo { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
     .sx-logo-mark {
         width: 26px; height: 26px; border-radius: 7px; background: #E8A33D;
