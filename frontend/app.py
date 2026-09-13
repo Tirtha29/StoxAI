@@ -87,17 +87,18 @@ st.markdown(
     #MainMenu, footer {visibility: hidden;}
     header[data-testid="stHeader"] { background: transparent; }
 
+    /* Sidebar: native collapse/expand behavior left intact on purpose —
+       do NOT override display/visibility/transform/width here, and do NOT
+       hide [data-testid="collapsedControl"]. Doing either breaks the
+       expand arrow (it has nowhere to reappear) and breaks mobile (the
+       sidebar can no longer slide off-screen, so it just eats the
+       viewport). Only cosmetic, non-layout rules belong in this block. */
     section[data-testid="stSidebar"] {
-        display: block !important;
-        visibility: visible !important;
-        transform: none !important;
-        min-width: 21rem !important;
-        width: 21rem !important;
-        margin-left: 0px !important;
+        background-color: #0D1524;
     }
-    [data-testid="collapsedControl"],
-    [data-testid="stSidebarCollapseButton"],
-    button[kind="header"] { display: none !important; }
+    section[data-testid="stSidebar"] > div:first-child {
+        width: 21rem;
+    }
     .sx-logo { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
     .sx-logo-mark {
         width: 26px; height: 26px; border-radius: 7px; background: #E8A33D;
@@ -125,7 +126,6 @@ st.markdown(
         background-color: #E8A33D !important; color: #1A1204 !important; border: none !important;
         border-radius: 8px; font-weight: 600;
     }
-    section[data-testid="stSidebar"] { background-color: #0D1524; }
     .stMarkdown table {
         width: 100% !important;
         border-collapse: collapse !important;
